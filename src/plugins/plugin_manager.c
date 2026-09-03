@@ -1,3398 +1,2700 @@
-#include "plugin_manager.h"
-#include "gui.h"
-#include "gui_reload.h"
 #include "audio.h"
+
+#define DR_FLAC_IMPLEMENTATION
+#include "dr_flac.h"
+#define DR_MP3_IMPLEMENTATION
+#include "dr_mp3.h"
+#define DR_WAV_IMPLEMENTATION
+#include "dr_wav.h"
+#include "aiff_decoder.h"
+#include "dsd_decoder.h"
+#include "aac_decoder.h"
+#include "alac_decoder.h"
+#include "mp4_demux.h"
+#include "ape_decoder.h"
+#include "wma_decoder.h"
+#include "opus_decoder.h"
+#include "ogg_demux.h"
+#include "vorbis_decoder.h"
 #include "peq.h"
-#include "http_client.h"
-#include "playlist_files.h"
-#include "plugin_json.h"
-#include "plugin_storage.h"
-#include "plugin_disabled_list.h"
-#include "app_version.h"
-#include "fallback_font.h"
-#include "mbedtls/md5.h" /* plugin.md5() -- same primitive subsonic_client.c already uses for its own token auth */
+#include "http_stream.h"
+#include "remote_track.h"
 
-#include "lua.h"
-#include "lauxlib.h"
-#include "lualib.h"
-
-#include <dirent.h>
-#include <fcntl.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <sys/stat.h>
-#include <pthread.h>
-#include <time.h>
-#include <errno.h>
-#include <stdatomic.h>
-#include <limits.h>
 #include <unistd.h>
+#include <limits.h>
+#include <inttypes.h>
+#include <stdatomic.h>
+
+#include "debug_log.h"
+#include "audio_helpers.h"
 
 #ifdef HOST_BUILD
-  #define MUSIC_ROOT_DIR "./music"
+  #include <SDL2/SDL.h>
 #else
-  /* SD card mount point -- see gui.c's own MUSIC_ROOT_DIR comment; each
-   * file that needs it defines its own copy rather than sharing a header,
-   * matching gui.c/remote_control.c/metadata_db.c already doing the same. */
-  #define MUSIC_ROOT_DIR "/data/mnt/sd_0"
-
-  /* Same override root assets.c's own asset_path() checks (see its own
-   * comment there) -- duplicated here rather than shared via a header,
-   * same convention as MUSIC_ROOT_DIR above. Only defined on target:
-   * asset_path() never checks any override root on HOST_BUILD, so
-   * plugin.set_icon() is a no-op there (see its own comment below) rather
-   * than writing files nothing would ever read. */
-  #define PLUGIN_THEME_OVERRIDE_ROOT "/usr/data/theme_overrides/"
+  #include "audio_output.h"
 #endif
 
-/* Same "each file defines its own derived-path macro" convention as
- * MUSIC_ROOT_DIR above -- matches gui.c's own PLAYLISTS_DIR exactly. */
-#define PLAYLISTS_DIR MUSIC_ROOT_DIR "/Playlists"
+#define NORMAL_CHUNK_FRAMES 4096
+#define LOW_POWER_CHUNK_FRAMES 8192
+#define MAX_CHUNK_FRAMES LOW_POWER_CHUNK_FRAMES
 
-#define PLUGIN_MAX_FILES 16
-#define PLUGIN_MAX_LIST_ITEMS 500
-#define PLUGIN_MAX_ASYNC_HTTP 4
-#define PLUGIN_ASYNC_HTTP_DEFAULT_MAX (512U * 1024U)
-#define PLUGIN_ASYNC_HTTP_MAX_RESPONSE (2U * 1024U * 1024U)
-#define PLUGIN_ASYNC_HTTP_MAX_REQUEST (1024U * 1024U)
+/* --- Decoder dispatch: dr_flac/dr_mp3/dr_wav all expose the same shape of
+ * API (open, channels/sampleRate, read_pcm_frames_s16, seek_to_pcm_frame,
+ * close) but aren't literally the same type, so this is just a small tagged
+ * union picking the right calls rather than a new abstraction layer. */
 
-typedef struct {
-    lua_State * L;
-    int open_ref; /* LUA_REGISTRYINDEX ref to the on_open function */
-    char id[40];  /* only set/used for plugin_home_tiles[] -- empty for plugin_stream_tiles[],
-                     which has no reordering concept and so never needs a stable name to
-                     reference; home_layout_config.order[]/tiles[] key lookups need one. */
-    char label[64];
-    char icon[96];
-    char icon_selected[96];
-} plugin_tile_t;
-
-/* Leaner sibling of plugin_tile_t for plugin.register_list_item() -- pill-
- * list rows (screen_builders.h's pill_list_item_t) now DO have an icon/
- * height/width/text_size slot (this session's row-layout work),
- * populated from this call's optional 4th `options` table -- see
- * append_list_item()'s own comment. Empty string ("") means "unset" for
- * icon_path/text_size, matching pill_list_item_t's own NULL convention one
- * level up (plugin_manager_get_*_list_item_options() below translates
- * empty-string back to NULL for its callers). */
-typedef struct {
-    lua_State * L;
-    int open_ref;
-    char label[64];
-    char icon_path[256];
-    int32_t row_height;
-    int32_t row_width;
-    char text_size[8];
-} plugin_list_item_t;
+typedef enum {
+    DECODER_FLAC,
+    DECODER_MP3,
+    DECODER_WAV,
+    DECODER_AIFF,
+    DECODER_DSD,
+    DECODER_AAC,
+    DECODER_ALAC,
+    DECODER_APE,
+    DECODER_WMA,
+    DECODER_OPUS,
+    DECODER_VORBIS
+} decoder_type_t;
 
 typedef struct {
-    lua_State * L;
-    char id[64];
-    char name[96];
-    char version[32];
-    bool defined;
-    time_t last_library_refresh;
-    /* Source filename (basename, e.g. "Themes.lua"), not just the derived
-     * plugin id -- needed by plugin_manager_scan_available() to map a
-     * loaded instance back to the file it came from even when the plugin
-     * declared its own custom plugin.define() id rather than falling back
-     * to the "legacy.<filename>" id below. */
-    char filename[256];
-} plugin_instance_t;
+    decoder_type_t type;
+    union {
+        drflac * flac;
+        drmp3 * mp3;
+        drwav * wav;
+        aiff_decoder_t * aiff;
+        dsd_decoder_t * dsd;
+        aac_decoder_t * aac;
+        alac_decoder_t * alac;
+        ape_decoder_t * ape;
+        wma_decoder_t * wma;
+        opus_decoder_wrap_t * opus;
+        vorbis_decoder_wrap_t * vorbis;
+    } as;
+    unsigned int channels;
+    unsigned int sample_rate;
+    unsigned int source_sample_rate;
+    unsigned int source_bit_depth;
+    unsigned int bitrate_kbps;
+    uint64_t total_frames;
 
-static plugin_instance_t plugin_instances[PLUGIN_MAX_FILES];
-static int plugin_instance_count = 0;
-static int loading_plugin_slot = -1;
+    /* Local MP3 only. dr_mp3 never owns a bound seek table, so this tagged
+     * decoder owns and frees it alongside the drmp3 instance. */
+    drmp3_seek_point * mp3_seek_points;
+    drmp3_uint32 mp3_seek_point_count;
+    bool mp3_seek_index_attempted;
 
-/* plugin.storage and plugin.secrets need to know WHICH plugin is calling
- * at arbitrary runtime (not just at plugin.define() time, unlike
- * loading_plugin_slot above) -- each plugin owns exactly one lua_State for
- * its whole lifetime (this file's own top comment), so a linear scan
- * matching L is enough; PLUGIN_MAX_FILES is small and this only runs on
- * an explicit plugin.storage/secrets call, not per frame. */
-static plugin_instance_t * plugin_instance_for_state(lua_State * L) {
-    for (int i = 0; i < PLUGIN_MAX_FILES; i++) {
-        if (plugin_instances[i].L == L) return &plugin_instances[i];
+    /* Non-NULL only for a live network stream opened via a URL (see
+     * is_stream_url() below) -- decoder_close() must also tear this down,
+     * and decoder_seek() must refuse to seek while it's set (there's
+     * nothing to seek back to on a live source). type is still DECODER_MP3
+     * in that case: dr_mp3's decode/read calls don't care whether the
+     * drmp3* was opened against a local file or a read callback, only
+     * decoder_open()/decoder_close() need to know the difference. */
+    http_stream_t * net_stream;
+} decoder_t;
+
+/* A stream URL is never dispatched by file extension (see decoder_open()
+ * below) -- most internet radio URLs don't end in anything recognizable
+ * anyway (an opaque mount point, or a query string). */
+static bool is_stream_url(const char * path) {
+    return strncasecmp(path, "http://", 7) == 0 || strncasecmp(path, "https://", 8) == 0;
+}
+
+/* A trailing "#.<ext>" on a stream URL is a local-only format hint (never
+ * sent to the server -- http_conn_parse_url() strips it, see that
+ * function's own comment): the '#' can't legally appear in a Subsonic/
+ * plugin-built URL's own path or query otherwise (this app always
+ * percent-encodes it via url_encode()), so a literal one is unambiguously
+ * ours. Absent a hint, MP3 stays the default (unchanged from before this
+ * hint existed, so plain internet-radio URLs work exactly as before). */
+static const char * stream_format_hint(const char * url) {
+    const char * frag = strrchr(url, '#');
+    return frag ? frag + 1 : NULL;
+}
+
+static size_t stream_read_cb(void * user_data, void * buf, size_t bytes_to_read) {
+    return http_stream_read((http_stream_t *) user_data, buf, bytes_to_read);
+}
+
+/* FLAC's onSeek is NOT optional (unlike dr_mp3's) -- drflac_open() itself
+ * requires a non-NULL callback. Passing onTell=NULL below skips the only
+ * place dr_flac would ever ask for an absolute/backward seek (the
+ * SEEK_END-then-SEEK_SET-back file-size sanity check in
+ * drflac__read_and_decode_metadata(), gated on "onTell != NULL && onSeek !=
+ * NULL" -- confirmed by reading dr_flac.h directly, not assumed), so this
+ * only ever needs to handle a DRFLAC_SEEK_CUR forward skip (used to skip
+ * past metadata blocks this app doesn't care about -- PADDING, SEEKTABLE,
+ * CUESHEET, PICTURE, VORBIS_COMMENT since onMeta is also NULL here). A live
+ * stream can't seek backward at all, so anything else fails cleanly rather
+ * than silently doing the wrong thing. */
+static drflac_bool32 flac_stream_seek_cb(void * user_data, int offset, drflac_seek_origin origin) {
+    if (origin != DRFLAC_SEEK_CUR || offset < 0) return DRFLAC_FALSE;
+    uint8_t discard[1024];
+    int remaining = offset;
+    while (remaining > 0) {
+        size_t take = (size_t) remaining < sizeof(discard) ? (size_t) remaining : sizeof(discard);
+        if (http_stream_read((http_stream_t *) user_data, discard, take) != take) return DRFLAC_FALSE;
+        remaining -= (int) take;
     }
+    return DRFLAC_TRUE;
+}
+
+static bool decoder_open(decoder_t * dec, const char * path) {
+    memset(dec, 0, sizeof(*dec));
+
+    /* A remote-provider track (plugin.play_remote(), see remote_track.h):
+     * path is the stable "remote://<provider>/<track_id>" synthetic key
+     * used for Favorites/History/resume, never a fetchable URL itself --
+     * the real, possibly time-limited fetch URL and verify_tls live in the
+     * looked-up descriptor. Its codec is declared up front by the plugin
+     * (already known from the catalog API, no server round trip needed to
+     * find out), so this skips the extension/fragment-hint/Content-Type
+     * sniffing below entirely -- that sniffing stays exactly as it was for
+     * radio/Subsonic streams, which don't have a declared codec. */
+    remote_track_meta_t remote_meta;
+    bool remote = remote_track_path_is_remote(path) && remote_track_meta_copy_for_path(path, &remote_meta);
+    if (remote_track_path_is_remote(path) && !remote) return false; /* stale/replaced queue entry */
+
+    if (remote || is_stream_url(path)) {
+        const char * hint = remote ? NULL : stream_format_hint(path);
+        bool is_flac = remote ? (strcasecmp(remote_meta.codec, "flac") == 0)
+                              : (hint && strcasecmp(hint, ".flac") == 0);
+        bool is_aac = remote ? (strcasecmp(remote_meta.codec, "aac") == 0)
+                             : (hint && (strcasecmp(hint, ".aac") == 0 || strcasecmp(hint, ".aacp") == 0));
+
+        /* Live network stream -- MP3/FLAC use their callback-based decoder
+         * APIs, while ADTS AAC uses aac_open_stream()'s incremental framing
+         * path. FLAC's callback seek constraints are documented above;
+         * dr_mp3 tolerates NULL onSeek/onTell, and live AAC never seeks or
+         * prescans. Other formats still require a finite file/container.
+         * Absent a recognized hint or AAC Content-Type, MP3 remains the
+         * default for compatibility with ordinary internet-radio URLs. */
+        dec->net_stream = http_stream_open(remote ? remote_meta.stream_url : path, remote ? remote_meta.verify_tls : true);
+        if (!dec->net_stream) return false;
+
+        if (!remote) {
+            const char * content_type = http_stream_content_type(dec->net_stream);
+            if (strncasecmp(content_type, "audio/aac", 9) == 0) is_aac = true;
+        }
+
+        if (is_aac) {
+            dec->type = DECODER_AAC;
+            dec->as.aac = aac_open_stream(stream_read_cb, dec->net_stream);
+            if (!dec->as.aac) {
+                http_stream_close(dec->net_stream);
+                dec->net_stream = NULL;
+                return false;
+            }
+            dec->channels = aac_get_channels(dec->as.aac);
+            dec->sample_rate = aac_get_sample_rate(dec->as.aac);
+            dec->source_sample_rate = dec->sample_rate;
+            dec->source_bit_depth = remote ? remote_meta.bit_depth : 0;
+            dec->bitrate_kbps = remote ? remote_meta.bitrate_kbps : 0;
+            /* A remote track declares its own duration up front (the
+             * plugin's catalog metadata) -- unlike plain internet radio,
+             * there's no need to leave this at the unknown-duration 0
+             * below; a plain stream URL (remote == false) still has no
+             * such source and keeps today's behavior exactly. */
+            dec->total_frames = (remote && remote_meta.duration_ms > 0)
+                                     ? (uint64_t) ((double) remote_meta.duration_ms / 1000.0 * dec->sample_rate)
+                                     : 0;
+            return true;
+        }
+
+        if (is_flac) {
+            dec->type = DECODER_FLAC;
+            dec->as.flac = drflac_open(stream_read_cb, flac_stream_seek_cb, NULL, dec->net_stream, NULL);
+            if (!dec->as.flac) {
+                http_stream_close(dec->net_stream);
+                dec->net_stream = NULL;
+                return false;
+            }
+            dec->channels = dec->as.flac->channels;
+            dec->sample_rate = dec->as.flac->sampleRate;
+            dec->source_sample_rate = dec->sample_rate;
+            dec->source_bit_depth = dec->as.flac->bitsPerSample;
+            dec->bitrate_kbps = remote ? remote_meta.bitrate_kbps : 0;
+            /* Unlike MP3, this is a REAL, authoritative count straight from
+             * the STREAMINFO metadata block (near the top of the file, not
+             * a full-stream prescan) -- safe to use for real, matching
+             * local FLAC playback below. Gives a Subsonic FLAC stream a
+             * correct duration/progress bar for free, unlike MP3 streams
+             * (which have no equivalent authoritative source without a
+             * full prescan, so those stay at the unknown-duration 0 below). */
+            dec->total_frames = dec->as.flac->totalPCMFrameCount;
+            return true;
+        }
+
+        dec->type = DECODER_MP3;
+        dec->as.mp3 = malloc(sizeof(drmp3));
+        if (!dec->as.mp3 || !drmp3_init(dec->as.mp3, stream_read_cb, NULL, NULL, NULL, dec->net_stream, NULL)) {
+            free(dec->as.mp3);
+            dec->as.mp3 = NULL;
+            http_stream_close(dec->net_stream);
+            dec->net_stream = NULL;
+            return false;
+        }
+        dec->channels = dec->as.mp3->channels;
+        dec->sample_rate = dec->as.mp3->sampleRate;
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = remote ? remote_meta.bit_depth : 0;
+        dec->bitrate_kbps = remote ? remote_meta.bitrate_kbps : 0;
+        /* See the AAC branch's own comment just above -- a remote track's
+         * declared duration_ms substitutes for the prescan this never does
+         * on a live stream; a plain MP3 stream URL (remote == false, e.g.
+         * internet radio or a Subsonic stream) has no such source and
+         * keeps today's unknown-duration-until-EOF behavior exactly. */
+        dec->total_frames = (remote && remote_meta.duration_ms > 0)
+                                 ? (uint64_t) ((double) remote_meta.duration_ms / 1000.0 * dec->sample_rate)
+                                 : 0;
+        return true;
+    }
+
+    const char * ext = strrchr(path, '.');
+    if (!ext) return false;
+
+    if (strcasecmp(ext, ".flac") == 0) {
+        dec->type = DECODER_FLAC;
+        dec->as.flac = drflac_open_file(path, NULL);
+        if (!dec->as.flac) return false;
+        dec->channels = dec->as.flac->channels;
+        dec->sample_rate = dec->as.flac->sampleRate;
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = dec->as.flac->bitsPerSample;
+        dec->total_frames = dec->as.flac->totalPCMFrameCount;
+        return true;
+    }
+
+    if (strcasecmp(ext, ".mp3") == 0) {
+        dec->type = DECODER_MP3;
+        dec->as.mp3 = malloc(sizeof(drmp3));
+        if (!dec->as.mp3 || !drmp3_init_file(dec->as.mp3, path, NULL)) {
+            free(dec->as.mp3);
+            dec->as.mp3 = NULL;
+            return false;
+        }
+        dec->channels = dec->as.mp3->channels;
+        dec->sample_rate = dec->as.mp3->sampleRate;
+        dec->source_sample_rate = dec->sample_rate;
+        dec->total_frames = drmp3_get_pcm_frame_count(dec->as.mp3);
+        return true;
+    }
+
+    if (strcasecmp(ext, ".wav") == 0) {
+        dec->type = DECODER_WAV;
+        dec->as.wav = malloc(sizeof(drwav));
+        if (!dec->as.wav || !drwav_init_file(dec->as.wav, path, NULL)) {
+            free(dec->as.wav);
+            dec->as.wav = NULL;
+            return false;
+        }
+        dec->channels = dec->as.wav->channels;
+        dec->sample_rate = dec->as.wav->sampleRate;
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = dec->as.wav->bitsPerSample;
+        dec->total_frames = dec->as.wav->totalPCMFrameCount;
+        return true;
+    }
+
+    if (strcasecmp(ext, ".aiff") == 0 || strcasecmp(ext, ".aif") == 0) {
+        dec->type = DECODER_AIFF;
+        dec->as.aiff = aiff_open_file(path);
+        if (!dec->as.aiff) return false;
+        dec->channels = aiff_get_channels(dec->as.aiff);
+        dec->sample_rate = aiff_get_sample_rate(dec->as.aiff);
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = aiff_get_bits_per_sample(dec->as.aiff);
+        dec->total_frames = aiff_get_total_pcm_frame_count(dec->as.aiff);
+        return true;
+    }
+
+    if (strcasecmp(ext, ".dsf") == 0 || strcasecmp(ext, ".dff") == 0) {
+        dec->type = DECODER_DSD;
+        dec->as.dsd = dsd_open_file(path);
+        if (!dec->as.dsd) return false;
+        dec->channels = dsd_get_channels(dec->as.dsd);
+        dec->sample_rate = dsd_get_pcm_sample_rate(dec->as.dsd); /* decimated PCM rate, not the raw DSD rate */
+        dec->source_sample_rate = dsd_get_source_sample_rate(dec->as.dsd);
+        dec->source_bit_depth = 1;
+        dec->total_frames = dsd_get_total_pcm_frame_count(dec->as.dsd);
+        return true;
+    }
+
+    if (strcasecmp(ext, ".aac") == 0) {
+        dec->type = DECODER_AAC;
+        dec->as.aac = aac_open_file(path);
+        if (!dec->as.aac) return false;
+        dec->channels = aac_get_channels(dec->as.aac);
+        dec->sample_rate = aac_get_sample_rate(dec->as.aac);
+        dec->source_sample_rate = dec->sample_rate;
+        dec->total_frames = aac_get_total_pcm_frame_count(dec->as.aac);
+        return true;
+    }
+
+    if (strcasecmp(ext, ".m4a") == 0 || strcasecmp(ext, ".m4b") == 0) {
+        /* .m4a/.m4b is a container, not a codec -- peek which one is actually
+         * inside (ALAC or AAC) before picking a decoder. The real decoders
+         * each open their own mp4_demux_t; this one is just for the peek. */
+        char fourcc[5];
+        if (!mp4_demux_peek_codec(path, fourcc)) return false;
+
+        if (strcmp(fourcc, "alac") == 0) {
+            dec->type = DECODER_ALAC;
+            dec->as.alac = alac_open_file(path);
+            if (!dec->as.alac) return false;
+            dec->channels = alac_get_channels(dec->as.alac);
+            dec->sample_rate = alac_get_sample_rate(dec->as.alac);
+            dec->source_sample_rate = dec->sample_rate;
+            dec->source_bit_depth = alac_get_bit_depth(dec->as.alac);
+            dec->total_frames = alac_get_total_pcm_frame_count(dec->as.alac);
+            return true;
+        }
+        if (strcmp(fourcc, "mp4a") == 0) {
+            dec->type = DECODER_AAC;
+            dec->as.aac = aac_open_file_mp4(path);
+            if (!dec->as.aac) return false;
+            dec->channels = aac_get_channels(dec->as.aac);
+            dec->sample_rate = aac_get_sample_rate(dec->as.aac);
+            dec->source_sample_rate = dec->sample_rate;
+            dec->total_frames = aac_get_total_pcm_frame_count(dec->as.aac);
+            return true;
+        }
+        return false;
+    }
+
+    if (strcasecmp(ext, ".ape") == 0) {
+        dec->type = DECODER_APE;
+        dec->as.ape = ape_open_file(path);
+        if (!dec->as.ape) return false;
+        dec->channels = ape_get_channels(dec->as.ape);
+        dec->sample_rate = ape_get_sample_rate(dec->as.ape);
+        dec->source_sample_rate = dec->sample_rate;
+        dec->source_bit_depth = ape_get_bits_per_sample(dec->as.ape);
+        dec->total_frames = ape_get_total_pcm_frame_count(dec->as.ape);
+        return true;
+    }
+
+    if (strcasecmp(ext, ".wma") == 0) {
+        dec->type = DECODER_WMA;
+        dec->as.wma = wma_open_file(path);
+        if (!dec->as.wma) return false;
+        dec->channels = wma_get_channels(dec->as.wma);
+        dec->sample_rate = wma_get_sample_rate(dec->as.wma);
+        dec->source_sample_rate = dec->sample_rate;
+        dec->total_frames = wma_get_total_pcm_frame_count(dec->as.wma);
+        return true;
+    }
+
+    if (strcasecmp(ext, ".opus") == 0) {
+        dec->type = DECODER_OPUS;
+        dec->as.opus = opus_open_file(path);
+        if (!dec->as.opus) return false;
+        dec->channels = opus_get_channels(dec->as.opus);
+        dec->sample_rate = opus_get_sample_rate(dec->as.opus);
+        dec->source_sample_rate = dec->sample_rate;
+        dec->total_frames = opus_get_total_pcm_frame_count(dec->as.opus);
+        return true;
+    }
+
+    if (strcasecmp(ext, ".ogg") == 0) {
+        ogg_codec_t codec = ogg_detect_codec(path);
+        if (codec == OGG_CODEC_OPUS) {
+            dec->type = DECODER_OPUS;
+            dec->as.opus = opus_open_file(path);
+            if (!dec->as.opus) return false;
+            dec->channels = opus_get_channels(dec->as.opus);
+            dec->sample_rate = opus_get_sample_rate(dec->as.opus);
+            dec->source_sample_rate = dec->sample_rate;
+            dec->total_frames = opus_get_total_pcm_frame_count(dec->as.opus);
+            return true;
+        }
+        if (codec == OGG_CODEC_VORBIS) {
+            dec->type = DECODER_VORBIS;
+            dec->as.vorbis = vorbis_open_file(path);
+            if (!dec->as.vorbis) return false;
+            dec->channels = vorbis_get_channels(dec->as.vorbis);
+            dec->sample_rate = vorbis_get_sample_rate(dec->as.vorbis);
+            dec->source_sample_rate = dec->sample_rate;
+            dec->total_frames = vorbis_get_total_pcm_frame_count(dec->as.vorbis);
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
+static decoder_read_result_t decoder_read_s16(decoder_t * dec, uint64_t frames, int16_t * buf) {
+    decoder_read_result_t res = { .frames = 0, .status = DECODER_READ_OK };
+    if (!dec || !buf) {
+        res.status = DECODER_READ_FATAL_ERROR;
+        return res;
+    }
+
+    switch (dec->type) {
+        case DECODER_FLAC: {
+            uint64_t r = drflac_read_pcm_frames_s16(dec->as.flac, frames, buf);
+            res.frames = r;
+            res.status = (r > 0) ? DECODER_READ_OK : DECODER_READ_EOF;
+            return res;
+        }
+        case DECODER_MP3: {
+            uint64_t r = drmp3_read_pcm_frames_s16(dec->as.mp3, frames, buf);
+            res.frames = r;
+            res.status = (r > 0) ? DECODER_READ_OK : DECODER_READ_EOF;
+            return res;
+        }
+        case DECODER_WAV: {
+            uint64_t r = drwav_read_pcm_frames_s16(dec->as.wav, frames, buf);
+            res.frames = r;
+            res.status = (r > 0) ? DECODER_READ_OK : DECODER_READ_EOF;
+            return res;
+        }
+        case DECODER_AIFF:
+            return aiff_read_pcm_frames_s16(dec->as.aiff, frames, buf);
+        case DECODER_DSD:
+            return dsd_read_pcm_frames_s16(dec->as.dsd, frames, buf);
+        case DECODER_AAC:
+            return aac_read_pcm_frames_s16(dec->as.aac, frames, buf);
+        case DECODER_ALAC:
+            return alac_read_pcm_frames_s16(dec->as.alac, frames, buf);
+        case DECODER_APE:
+            return ape_read_pcm_frames_s16(dec->as.ape, frames, buf);
+        case DECODER_WMA:
+            return wma_read_pcm_frames_s16(dec->as.wma, frames, buf);
+        case DECODER_OPUS:
+            return opus_read_pcm_frames_s16(dec->as.opus, frames, buf);
+        case DECODER_VORBIS:
+            return vorbis_read_pcm_frames_s16(dec->as.vorbis, frames, buf);
+    }
+    res.status = DECODER_READ_FATAL_ERROR;
+    return res;
+}
+
+#define MP3_SEEK_INDEX_MIN_SECONDS (10u * 60u)
+#define MP3_SEEK_INDEX_INTERVAL_SECONDS 30u
+#define MP3_SEEK_INDEX_MAX_POINTS 256u
+
+static bool mp3_needs_seek_index(const decoder_t * dec) {
+    return dec && !dec->net_stream && dec->type == DECODER_MP3 && dec->sample_rate > 0 &&
+           dec->total_frames >= (uint64_t) dec->sample_rate * MP3_SEEK_INDEX_MIN_SECONDS;
+}
+
+static bool decoder_seek(decoder_t * dec, uint64_t frame) {
+    if (dec->net_stream) return false; /* live stream -- cannot seek */
+    switch (dec->type) {
+        case DECODER_FLAC:   return drflac_seek_to_pcm_frame(dec->as.flac, frame) != 0;
+        case DECODER_MP3:
+            if (frame > 0 && mp3_needs_seek_index(dec) && !dec->mp3_seek_points) return false;
+            return drmp3_seek_to_pcm_frame(dec->as.mp3, frame) != 0;
+        case DECODER_WAV:    return drwav_seek_to_pcm_frame(dec->as.wav, frame) != 0;
+        case DECODER_AIFF:   return aiff_seek_to_pcm_frame(dec->as.aiff, frame);
+        case DECODER_DSD:    return dsd_seek_to_pcm_frame(dec->as.dsd, frame);
+        case DECODER_AAC:    return aac_seek_to_pcm_frame(dec->as.aac, frame);
+        case DECODER_ALAC:   return alac_seek_to_pcm_frame(dec->as.alac, frame);
+        case DECODER_APE:    return ape_seek_to_pcm_frame(dec->as.ape, frame);
+        case DECODER_WMA:    return wma_seek_to_pcm_frame(dec->as.wma, frame);
+        case DECODER_OPUS:   return opus_seek_to_pcm_frame(dec->as.opus, frame);
+        case DECODER_VORBIS: return vorbis_seek_to_pcm_frame(dec->as.vorbis, frame);
+    }
+    return false;
+}
+
+static void decoder_close(decoder_t * dec) {
+    switch (dec->type) {
+        case DECODER_FLAC:
+            if (dec->as.flac) drflac_close(dec->as.flac);
+            if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
+            break;
+        case DECODER_MP3:
+            if (dec->as.mp3) {
+                drmp3_bind_seek_table(dec->as.mp3, 0, NULL);
+                drmp3_uninit(dec->as.mp3);
+                free(dec->as.mp3);
+            }
+            free(dec->mp3_seek_points);
+            dec->mp3_seek_points = NULL;
+            dec->mp3_seek_point_count = 0;
+            if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
+            break;
+        case DECODER_WAV:
+            if (dec->as.wav) { drwav_uninit(dec->as.wav); free(dec->as.wav); }
+            break;
+        case DECODER_AIFF:
+            if (dec->as.aiff) aiff_close(dec->as.aiff);
+            break;
+        case DECODER_DSD:
+            if (dec->as.dsd) dsd_close(dec->as.dsd);
+            break;
+        case DECODER_AAC:
+            if (dec->as.aac) aac_close(dec->as.aac);
+            if (dec->net_stream) { http_stream_close(dec->net_stream); dec->net_stream = NULL; }
+            break;
+        case DECODER_ALAC:
+            if (dec->as.alac) alac_close(dec->as.alac);
+            break;
+        case DECODER_APE:
+            if (dec->as.ape) ape_close(dec->as.ape);
+            break;
+        case DECODER_WMA:
+            if (dec->as.wma) wma_close(dec->as.wma);
+            break;
+        case DECODER_OPUS:
+            if (dec->as.opus) opus_close(dec->as.opus);
+            break;
+        case DECODER_VORBIS:
+            if (dec->as.vorbis) vorbis_close(dec->as.vorbis);
+            break;
+    }
+}
+
+/* --- Playback state ---
+ *
+ * A single playback thread lives for the app's whole lifetime (created once
+ * by audio_init(), never joined) rather than one thread per track, so that
+ * gapless and crossfade transitions between tracks never have to tear down
+ * and reopen the output device or spin up a fresh thread. gui.c still owns
+ * the playlist and its current index; this layer just plays "current" and,
+ * optionally, knows about "next" (audio_set_next_track()) so it can prefetch
+ * and, near current's natural end, either hand off seamlessly (gapless) or
+ * blend the two (crossfade) entirely on its own -- no GUI round-trip.
+ * Explicit user actions (tapping a different track, prev/next buttons, the
+ * initial pick) always go through audio_play_file_at(), which interrupts
+ * everything and restarts immediately with no fade, the same distinction
+ * most real DAPs make between a manual skip and automatic progression. */
+
+static pthread_t audio_thread;
+static pthread_mutex_t audio_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t audio_cond = PTHREAD_COND_INITIALIZER;
+
+static bool thread_started = false;
+
+static bool have_current = false;   /* something loaded (playing or paused) */
+static bool stop_requested = false;
+static bool paused = false;
+static bool track_finished = false; /* true EOF with no next track queued (or it failed to open) */
+static bool track_advanced = false; /* thread moved on to the queued next track on its own */
+static audio_error_t last_playback_error = AUDIO_ERROR_NONE;
+static uint64_t last_playback_error_generation = 0;
+
+static bool restart_requested = false;
+static uint64_t next_track_generation = 0;
+static char * restart_path = NULL;  /* owned; consumed by the thread on restart */
+static double restart_start_seconds = 0.0;
+static float restart_replaygain_linear = 1.0f;
+static bool restart_replaygain_applied = false;
+
+static char * next_path = NULL;     /* owned; staged by audio_set_next_track(), NULL = none queued */
+static float next_replaygain_linear = 1.0f;
+static bool next_replaygain_applied = false;
+
+static bool crossfade_enabled = false;
+#define CROSSFADE_SECONDS 3.0
+#define MAX_CHANNELS 8
+
+static float volume = 1.0f;      /* UI-facing 0.0-1.0 percent, what audio_get_volume() returns */
+static float volume_gain = 1.0f; /* actual linear PCM multiplier the playback thread applies -- see audio_set_volume() */
+static atomic_uint volume_set_generation = 0;
+static pthread_once_t volume_request_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t volume_request_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t volume_request_cond = PTHREAD_COND_INITIALIZER;
+static bool volume_request_worker_ready = false;
+static bool volume_request_pending = false;
+static float volume_requested_value = 1.0f;
+static unsigned int volume_requested_generation = 0;
+static bool low_power_mode = false;
+
+/* Every explicit track start advances this generation. Pending seeks are
+ * accepted only if they still belong to this exact track. */
+static uint64_t playback_generation = 0;
+static char * active_path = NULL; /* protected by audio_mutex */
+
+/* Seeks are coalesced commands on the playback-owned decoder, so rapid taps
+ * cannot stack decoder instances. */
+static bool seek_pending = false;
+static uint64_t seek_pending_frame = 0;
+static uint64_t seek_pending_playback_generation = 0;
+static bool seek_pending_is_percent = false;
+static double seek_pending_percent = 0.0;
+
+static uint64_t frames_played = 0;
+static uint64_t current_total_frames = 0;
+static unsigned int current_sample_rate = 0;
+static audio_current_format_info_t current_format_info;
+static uint64_t current_format_generation = 0;
+
+typedef enum {
+    MP3_INDEX_READY,
+    MP3_INDEX_TRANSIENT_FAILURE,
+    MP3_INDEX_PERMANENT_FAILURE
+} mp3_index_outcome_t;
+
+typedef struct mp3_index_job {
+    char * path;
+    uint64_t generation;
+    unsigned int sample_rate;
+    unsigned int channels;
+    uint64_t stream_length;
+    uint64_t stream_start_offset;
+    uint32_t delay_frames;
+    uint32_t padding_frames;
+    drmp3_uint32 count;
+    drmp3_seek_point * points;
+    mp3_index_outcome_t outcome;
+} mp3_index_job_t;
+
+/* One scan-only decoder may exist at a time. It never touches the live
+ * decoder; the playback thread adopts only its small completed table. */
+static bool mp3_index_worker_active = false;
+static mp3_index_job_t * mp3_index_result = NULL;
+static bool mp3_seek_deferred = false;
+static uint64_t mp3_seek_deferred_frame = 0;
+static uint64_t mp3_seek_deferred_generation = 0;
+static unsigned int mp3_seek_deferred_sample_rate = 0;
+static unsigned int mp3_seek_retry_count = 0;
+static uint64_t mp3_seek_retry_after_ms = 0;
+
+#define MP3_SEEK_RETRY_MAX 3u
+#define MP3_SEEK_RETRY_DELAY_MS 500u
+
+static uint64_t monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * 1000ULL + (uint64_t) now.tv_nsec / 1000000ULL;
+}
+
+/* audio_mutex must be held. A new user/resume target gets a fresh bounded
+ * retry budget; worker retries preserve the same target and budget. */
+static void defer_mp3_seek_locked(const decoder_t * dec, uint64_t generation,
+                                  uint64_t frame) {
+    mp3_seek_deferred = true;
+    mp3_seek_deferred_frame = frame;
+    mp3_seek_deferred_generation = generation;
+    mp3_seek_deferred_sample_rate = dec->sample_rate;
+    mp3_seek_retry_count = 0;
+    mp3_seek_retry_after_ms = 0;
+}
+
+static void finish_mp3_deferred_seek_locked(void) {
+    mp3_seek_deferred = false;
+    mp3_seek_retry_count = 0;
+    mp3_seek_retry_after_ms = 0;
+}
+
+static void free_mp3_index_job(mp3_index_job_t * job) {
+    if (!job) return;
+    free(job->points);
+    free(job->path);
+    free(job);
+}
+
+static void * mp3_index_worker(void * arg) {
+    mp3_index_job_t * job = arg;
+    struct timespec started, finished;
+    (void) nice(10); /* keep the single-core playback thread responsive */
+    clock_gettime(CLOCK_MONOTONIC, &started);
+
+    job->points = calloc(job->count, sizeof(*job->points));
+    drmp3 * scan = malloc(sizeof(*scan));
+    if (!job->points || !scan) {
+        free(scan);
+        job->outcome = MP3_INDEX_TRANSIENT_FAILURE;
+    } else {
+        bool opened = drmp3_init_file(scan, job->path, NULL) != 0;
+        bool same_file = opened && scan->sampleRate == job->sample_rate &&
+                         scan->channels == job->channels &&
+                         scan->streamLength == job->stream_length &&
+                         scan->streamStartOffset == job->stream_start_offset &&
+                         scan->delayInPCMFrames == job->delay_frames &&
+                         scan->paddingInPCMFrames == job->padding_frames;
+        if (!opened)
+            job->outcome = MP3_INDEX_TRANSIENT_FAILURE;
+        else if (!same_file)
+            job->outcome = MP3_INDEX_PERMANENT_FAILURE;
+        else
+            job->outcome = drmp3_calculate_seek_points(scan, &job->count, job->points) &&
+                           job->count > 0 ? MP3_INDEX_READY : MP3_INDEX_PERMANENT_FAILURE;
+        if (opened) drmp3_uninit(scan);
+        free(scan);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &finished);
+    uint64_t elapsed_ms = (uint64_t) (finished.tv_sec - started.tv_sec) * 1000ULL;
+    if (finished.tv_nsec >= started.tv_nsec)
+        elapsed_ms += (uint64_t) (finished.tv_nsec - started.tv_nsec) / 1000000ULL;
+    else
+        elapsed_ms -= 1000ULL - (uint64_t) (started.tv_nsec - finished.tv_nsec) / 1000000ULL;
+    DBG_LOG("audio: MP3 seek-index %s (%u points, %" PRIu64 " ms, %s)\n",
+            job->outcome == MP3_INDEX_READY ? "ready" : "failed",
+            job->count, elapsed_ms, safe_path_tail(job->path));
+
+    pthread_mutex_lock(&audio_mutex);
+    mp3_index_worker_active = false;
+    mp3_index_result = job;
+    pthread_cond_signal(&audio_cond);
+    pthread_mutex_unlock(&audio_mutex);
     return NULL;
 }
 
-/* Shared by every plugin.storage and plugin.secrets binding below --
- * requires plugin.define({id=...}) to have already run on this lua_State,
- * matching plugin_storage.c's own expectation that plugin_id is a real,
- * validated identity, not an empty/default string. */
-static const char * require_plugin_id(lua_State * L) {
-    plugin_instance_t * inst = plugin_instance_for_state(L);
-    if (!inst || !inst->defined || !inst->id[0]) {
-        luaL_error(L, "plugin.storage/secrets requires plugin.define({id=...}) to run first");
-        return NULL; /* unreachable -- luaL_error() longjmps */
-    }
-    return inst->id;
-}
-
-static const char * check_plugin_external_path(lua_State * L, int index, const char * api) {
-    const char * path = luaL_checkstring(L, index);
-    if (plugin_storage_path_is_reserved(path)) {
-        luaL_error(L, "%s: path is reserved for plugin.storage/plugin.secrets", api);
-        return NULL; /* unreachable -- luaL_error() longjmps */
-    }
-    return path;
-}
-
-static plugin_list_item_t plugin_books_list_items[PLUGIN_MAX_BOOKS_LIST_ITEMS];
-static int plugin_books_list_item_count = 0;
-
-static plugin_list_item_t plugin_settings_list_items[PLUGIN_MAX_SETTINGS_LIST_ITEMS];
-static int plugin_settings_list_item_count = 0;
-
-static plugin_list_item_t plugin_display_list_items[PLUGIN_MAX_DISPLAY_LIST_ITEMS];
-static int plugin_display_list_item_count = 0;
-
-static plugin_list_item_t plugin_playback_list_items[PLUGIN_MAX_PLAYBACK_LIST_ITEMS];
-static int plugin_playback_list_item_count = 0;
-
-static plugin_list_item_t plugin_power_list_items[PLUGIN_MAX_POWER_LIST_ITEMS];
-static int plugin_power_list_item_count = 0;
-
-static plugin_list_item_t plugin_system_list_items[PLUGIN_MAX_SYSTEM_LIST_ITEMS];
-static int plugin_system_list_item_count = 0;
-
-static plugin_tile_t plugin_stream_tiles[PLUGIN_MAX_STREAM_TILES];
-static int plugin_stream_tile_count = 0;
-
-static plugin_tile_t plugin_home_tiles[PLUGIN_MAX_HOME_TILES];
-static int plugin_home_tile_count = 0;
-
-typedef struct {
-    lua_State * L;
-    int select_ref;
-} plugin_list_callback_t;
-
-static plugin_list_callback_t plugin_list_callbacks[PLUGIN_LIST_SCREEN_POOL_SIZE];
-
-typedef struct {
-    lua_State * L;
-    int callback_ref;
-} plugin_settings_list_row_ref_t;
-
-static plugin_settings_list_row_ref_t
-    plugin_settings_list_rows[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE][PLUGIN_SETTINGS_LIST_MAX_ROWS];
-static int plugin_settings_list_row_counts[PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE];
-
-static void fill_tile_icon(plugin_tile_t * t, const char * icon, const char * default_icon,
-                            const char * default_icon_selected) {
-    if (icon) {
-        char base[80];
-        snprintf(base, sizeof(base), "%s", icon);
-        char * dot = strrchr(base, '.');
-        if (dot) *dot = '\0';
-        snprintf(t->icon, sizeof(t->icon), "%s", icon);
-        snprintf(t->icon_selected, sizeof(t->icon_selected), "%s_s.png", base);
-    } else {
-        snprintf(t->icon, sizeof(t->icon), "%s", default_icon);
-        snprintf(t->icon_selected, sizeof(t->icon_selected), "%s", default_icon_selected);
-    }
-}
-
-static bool is_valid_text_size(const char * text_size) {
-    return strcmp(text_size, "small") == 0 || strcmp(text_size, "medium") == 0 || strcmp(text_size, "large") == 0 ||
-           strcmp(text_size, "mono") == 0;
-}
-
-static void append_list_item(plugin_list_item_t * array, int * count, lua_State * L, const char * label) {
-    lua_pushvalue(L, 3);
-    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
-    plugin_list_item_t * item = &array[(*count)++];
-    item->L = L;
-    item->open_ref = ref;
-    utf8_truncate_safe(item->label, label, sizeof(item->label));
-    utf8_sanitize(item->label);
-    item->icon_path[0] = '\0';
-    item->row_height = 0;
-    item->row_width = 0;
-    item->text_size[0] = '\0';
-
-    if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
-        lua_getfield(L, 4, "icon");
-        const char * icon = lua_tostring(L, -1);
-        if (icon) snprintf(item->icon_path, sizeof(item->icon_path), "%s", icon);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 4, "height");
-        item->row_height = (int32_t) luaL_optinteger(L, -1, 0);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 4, "width");
-        item->row_width = (int32_t) luaL_optinteger(L, -1, 0);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 4, "text_size");
-        const char * text_size = lua_tostring(L, -1);
-        if (text_size) {
-            if (!is_valid_text_size(text_size)) {
-                lua_pop(L, 1);
-                luaL_error(L, "plugin.register_list_item: unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
-                           text_size);
-            }
-            snprintf(item->text_size, sizeof(item->text_size), "%s", text_size);
-        }
-        lua_pop(L, 1);
-    }
-}
-
-static int l_plugin_register_list_item(lua_State * L) {
-    const char * list_id = luaL_checkstring(L, 1);
-    const char * label = luaL_checkstring(L, 2);
-    luaL_checktype(L, 3, LUA_TFUNCTION);
-
-    if (strcmp(list_id, "books") == 0) {
-        if (plugin_books_list_item_count >= PLUGIN_MAX_BOOKS_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"books\" (max %d)",
-                               PLUGIN_MAX_BOOKS_LIST_ITEMS);
-        }
-        append_list_item(plugin_books_list_items, &plugin_books_list_item_count, L, label);
-    } else if (strcmp(list_id, "settings") == 0) {
-        if (plugin_settings_list_item_count >= PLUGIN_MAX_SETTINGS_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"settings\" (max %d)",
-                               PLUGIN_MAX_SETTINGS_LIST_ITEMS);
-        }
-        append_list_item(plugin_settings_list_items, &plugin_settings_list_item_count, L, label);
-    } else if (strcmp(list_id, "display") == 0) {
-        if (plugin_display_list_item_count >= PLUGIN_MAX_DISPLAY_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"display\" (max %d)",
-                               PLUGIN_MAX_DISPLAY_LIST_ITEMS);
-        }
-        append_list_item(plugin_display_list_items, &plugin_display_list_item_count, L, label);
-    } else if (strcmp(list_id, "playback") == 0) {
-        if (plugin_playback_list_item_count >= PLUGIN_MAX_PLAYBACK_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"playback\" (max %d)",
-                               PLUGIN_MAX_PLAYBACK_LIST_ITEMS);
-        }
-        append_list_item(plugin_playback_list_items, &plugin_playback_list_item_count, L, label);
-    } else if (strcmp(list_id, "power") == 0) {
-        if (plugin_power_list_item_count >= PLUGIN_MAX_POWER_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"power\" (max %d)",
-                               PLUGIN_MAX_POWER_LIST_ITEMS);
-        }
-        append_list_item(plugin_power_list_items, &plugin_power_list_item_count, L, label);
-    } else if (strcmp(list_id, "system") == 0) {
-        if (plugin_system_list_item_count >= PLUGIN_MAX_SYSTEM_LIST_ITEMS) {
-            return luaL_error(L, "plugin.register_list_item: too many items registered for \"system\" (max %d)",
-                               PLUGIN_MAX_SYSTEM_LIST_ITEMS);
-        }
-        append_list_item(plugin_system_list_items, &plugin_system_list_item_count, L, label);
-    } else {
-        return luaL_error(L, "plugin.register_list_item: unknown list_id '%s' (expected \"books\", \"settings\", \"display\", \"playback\", \"power\", or \"system\")", list_id);
-    }
-    return 0;
-}
-
-static int l_plugin_register_stream_media_tile(lua_State * L) {
-    const char * label = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TFUNCTION);
-    const char * icon = (lua_gettop(L) >= 3 && !lua_isnil(L, 3)) ? luaL_checkstring(L, 3) : NULL;
-
-    if (plugin_stream_tile_count >= PLUGIN_MAX_STREAM_TILES) {
-        return luaL_error(L, "too many stream media tiles registered (max %d)", PLUGIN_MAX_STREAM_TILES);
-    }
-
-    lua_pushvalue(L, 2);
-    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
-    plugin_tile_t * t = &plugin_stream_tiles[plugin_stream_tile_count++];
-    t->L = L;
-    t->open_ref = ref;
-    utf8_truncate_safe(t->label, label, sizeof(t->label));
-    utf8_sanitize(t->label);
-    fill_tile_icon(t, icon, "stream_media/radio.png", "stream_media/radio_s.png");
-    return 0;
-}
-
-static bool plugin_id_is_valid(const char * id);
-
-static int l_plugin_register_home_tile(lua_State * L) {
-    const char * id = luaL_checkstring(L, 1);
-    const char * label = luaL_checkstring(L, 2);
-    luaL_checktype(L, 3, LUA_TFUNCTION);
-    const char * icon = luaL_checkstring(L, 4);
-
-    if (!plugin_id_is_valid(id) || strlen(id) >= sizeof(plugin_home_tiles[0].id)) {
-        return luaL_error(L, "plugin.register_home_tile: id must be 1-%zu characters using letters, digits, '.', '_' or '-'",
-                           sizeof(plugin_home_tiles[0].id) - 1);
-    }
-    for (int k = 0; k < HOME_LAYOUT_TILE_COUNT; k++) {
-        if (strcmp(id, home_layout_tile_keys[k]) == 0) {
-            return luaL_error(L, "plugin.register_home_tile: id '%s' is reserved for the native Home tile of "
-                               "the same name -- pick a different id", id);
-        }
-    }
-    if (plugin_manager_find_home_tile_by_id(id) >= 0) {
-        return luaL_error(L, "plugin.register_home_tile: id '%s' is already registered", id);
-    }
-    if (plugin_home_tile_count >= PLUGIN_MAX_HOME_TILES) {
-        return luaL_error(L, "too many home tiles registered (max %d)", PLUGIN_MAX_HOME_TILES);
-    }
-    if (icon[0] == '\0') {
-        return luaL_error(L, "plugin.register_home_tile: icon must not be empty");
-    }
-    if (strlen(icon) >= 80) {
-        return luaL_error(L, "plugin.register_home_tile: icon path '%s' is too long (max 79 characters)", icon);
-    }
-
-    lua_pushvalue(L, 3);
-    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
-    plugin_tile_t * t = &plugin_home_tiles[plugin_home_tile_count++];
-    t->L = L;
-    t->open_ref = ref;
-    snprintf(t->id, sizeof(t->id), "%s", id);
-    utf8_truncate_safe(t->label, label, sizeof(t->label));
-    utf8_sanitize(t->label);
-    fill_tile_icon(t, icon, "", "");
-    return 0;
-}
-
-static int l_plugin_show_list(lua_State * L) {
-    const char * title = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TTABLE);
-    luaL_checktype(L, 3, LUA_TFUNCTION);
-
-    lua_Unsigned raw_n = lua_rawlen(L, 2);
-    int n = (raw_n > (lua_Unsigned) PLUGIN_MAX_LIST_ITEMS) ? PLUGIN_MAX_LIST_ITEMS : (int) raw_n;
-
-    static char label_bufs[PLUGIN_MAX_LIST_ITEMS][160];
-    static const char * labels[PLUGIN_MAX_LIST_ITEMS];
-    static char icon_bufs[PLUGIN_MAX_LIST_ITEMS][256];
-    static const char * icon_paths[PLUGIN_MAX_LIST_ITEMS];
-    static char text_size_bufs[PLUGIN_MAX_LIST_ITEMS][8];
-    static const char * text_sizes[PLUGIN_MAX_LIST_ITEMS];
-
-    for (int i = 0; i < n; i++) {
-        lua_rawgeti(L, 2, i + 1);
-        icon_bufs[i][0] = '\0';
-        icon_paths[i] = NULL;
-        text_size_bufs[i][0] = '\0';
-        text_sizes[i] = NULL;
-
-        if (lua_istable(L, -1)) {
-            lua_getfield(L, -1, "label");
-            const char * s = lua_tostring(L, -1);
-            snprintf(label_bufs[i], sizeof(label_bufs[i]), "%s", s ? s : "");
-            lua_pop(L, 1);
-
-            lua_getfield(L, -1, "icon");
-            const char * icon = lua_tostring(L, -1);
-            if (icon) {
-                snprintf(icon_bufs[i], sizeof(icon_bufs[i]), "%s", icon);
-                icon_paths[i] = icon_bufs[i];
-            }
-            lua_pop(L, 1);
-
-            lua_getfield(L, -1, "text_size");
-            const char * text_size = lua_tostring(L, -1);
-            if (text_size) {
-                if (!is_valid_text_size(text_size)) {
-                    return luaL_error(L, "plugin.show_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
-                                       i + 1, text_size);
-                }
-                snprintf(text_size_bufs[i], sizeof(text_size_bufs[i]), "%s", text_size);
-                text_sizes[i] = text_size_bufs[i];
-            }
-            lua_pop(L, 1);
-        } else {
-            const char * s = lua_tostring(L, -1);
-            snprintf(label_bufs[i], sizeof(label_bufs[i]), "%s", s ? s : "");
-        }
-        labels[i] = label_bufs[i];
-        lua_pop(L, 1);
-    }
-
-    int32_t height = 0;
-    int32_t width = 0;
-    int selected_index = -1;
-    if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
-        lua_getfield(L, 4, "height");
-        height = (int32_t) luaL_optinteger(L, -1, 0);
-        lua_pop(L, 1);
-        lua_getfield(L, 4, "width");
-        width = (int32_t) luaL_optinteger(L, -1, 0);
-        lua_pop(L, 1);
-        lua_getfield(L, 4, "selected");
-        if (!lua_isnil(L, -1)) {
-            lua_Integer selected = luaL_checkinteger(L, -1);
-            if (selected < 1 || selected > n)
-                return luaL_error(L, "plugin.show_list: selected index %lld is outside 1..%d",
-                                  (long long) selected, n);
-            selected_index = (int) selected - 1;
-        }
-        lua_pop(L, 1);
-    }
-
-    lua_pushvalue(L, 3);
-    int new_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    int slot = gui_plugin_show_list(title, labels, icon_paths, text_sizes, height, width, selected_index, n);
-    plugin_list_callback_t * cb = &plugin_list_callbacks[slot];
-    if (cb->L && cb->select_ref != LUA_NOREF) luaL_unref(cb->L, LUA_REGISTRYINDEX, cb->select_ref);
-    cb->L = L;
-    cb->select_ref = new_ref;
-    return 0;
-}
-
-static int l_plugin_show_settings_list(lua_State * L) {
-    const char * title = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TTABLE);
-
-    lua_Unsigned raw_n = lua_rawlen(L, 2);
-    int n = (raw_n > (lua_Unsigned) PLUGIN_SETTINGS_LIST_MAX_ROWS) ? PLUGIN_SETTINGS_LIST_MAX_ROWS : (int) raw_n;
-
-    static char label_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][96];
-    static const char * labels[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    static int row_types[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    static bool toggle_initial[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    static int slider_min[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    static int slider_max[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    static int slider_value[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    static char icon_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][256];
-    static const char * icon_paths[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    static int32_t heights[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    static int32_t widths[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    static char text_size_bufs[PLUGIN_SETTINGS_LIST_MAX_ROWS][8];
-    static const char * text_sizes[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-    int new_refs[PLUGIN_SETTINGS_LIST_MAX_ROWS];
-
-    int count = 0;
-    int slider_count = 0;
-    for (int i = 0; i < n; i++) {
-        lua_rawgeti(L, 2, i + 1);
-        if (!lua_istable(L, -1)) {
-            lua_pop(L, 1);
-            continue;
-        }
-
-        lua_getfield(L, -1, "type");
-        const char * type = lua_tostring(L, -1);
-        int row_type = -1;
-        if (type) {
-            if (strcmp(type, "row") == 0) row_type = PLUGIN_SETTINGS_ROW_TAP;
-            else if (strcmp(type, "toggle") == 0) row_type = PLUGIN_SETTINGS_ROW_TOGGLE;
-            else if (strcmp(type, "slider") == 0) row_type = PLUGIN_SETTINGS_ROW_SLIDER;
-        }
-        if (row_type < 0) {
-            return luaL_error(L, "plugin.show_settings_list: row %d has an unknown or missing type (expected \"row\", \"toggle\", or \"slider\")", i + 1);
-        }
-        lua_pop(L, 1);
-
-        if (row_type == PLUGIN_SETTINGS_ROW_SLIDER && slider_count >= PLUGIN_SETTINGS_LIST_MAX_SLIDERS) {
-            lua_pop(L, 1);
-            continue;
-        }
-
-        lua_getfield(L, -1, "label");
-        const char * label = lua_tostring(L, -1);
-        snprintf(label_bufs[count], sizeof(label_bufs[count]), "%s", label ? label : "");
-        lua_pop(L, 1);
-
-        const char * cb_field = (row_type == PLUGIN_SETTINGS_ROW_TAP) ? "on_select" : "on_change";
-        lua_getfield(L, -1, cb_field);
-        if (!lua_isfunction(L, -1)) {
-            return luaL_error(L, "plugin.show_settings_list: row %d ('%s') missing %s function", i + 1, label ? label : "", cb_field);
-        }
-        new_refs[count] = luaL_ref(L, LUA_REGISTRYINDEX);
-
-        toggle_initial[count] = false;
-        slider_min[count] = 0;
-        slider_max[count] = 100;
-        slider_value[count] = 0;
-        if (row_type == PLUGIN_SETTINGS_ROW_TOGGLE) {
-            lua_getfield(L, -1, "value");
-            toggle_initial[count] = lua_toboolean(L, -1);
-            lua_pop(L, 1);
-        } else if (row_type == PLUGIN_SETTINGS_ROW_SLIDER) {
-            lua_getfield(L, -1, "min");
-            slider_min[count] = (int) luaL_optinteger(L, -1, 0);
-            lua_pop(L, 1);
-            lua_getfield(L, -1, "max");
-            slider_max[count] = (int) luaL_optinteger(L, -1, 100);
-            lua_pop(L, 1);
-            lua_getfield(L, -1, "value");
-            slider_value[count] = (int) luaL_optinteger(L, -1, slider_min[count]);
-            lua_pop(L, 1);
-        }
-
-        icon_bufs[count][0] = '\0';
-        icon_paths[count] = NULL;
-        lua_getfield(L, -1, "icon");
-        const char * icon = lua_tostring(L, -1);
-        if (icon) {
-            snprintf(icon_bufs[count], sizeof(icon_bufs[count]), "%s", icon);
-            icon_paths[count] = icon_bufs[count];
-        }
-        lua_pop(L, 1);
-
-        lua_getfield(L, -1, "height");
-        heights[count] = (int32_t) luaL_optinteger(L, -1, 0);
-        lua_pop(L, 1);
-
-        lua_getfield(L, -1, "width");
-        widths[count] = (int32_t) luaL_optinteger(L, -1, 0);
-        lua_pop(L, 1);
-
-        text_size_bufs[count][0] = '\0';
-        text_sizes[count] = NULL;
-        lua_getfield(L, -1, "text_size");
-        const char * text_size = lua_tostring(L, -1);
-        if (text_size) {
-            if (!is_valid_text_size(text_size)) {
-                return luaL_error(L, "plugin.show_settings_list: row %d has an unknown text_size '%s' (expected \"small\", \"medium\", \"large\", or \"mono\")",
-                                   i + 1, text_size);
-            }
-            snprintf(text_size_bufs[count], sizeof(text_size_bufs[count]), "%s", text_size);
-            text_sizes[count] = text_size_bufs[count];
-        }
-        lua_pop(L, 1);
-
-        labels[count] = label_bufs[count];
-        row_types[count] = row_type;
-        if (row_type == PLUGIN_SETTINGS_ROW_SLIDER) slider_count++;
-        count++;
-
-        lua_pop(L, 1);
-    }
-
-    int slot = gui_plugin_show_settings_list(title, row_types, labels, toggle_initial, slider_min, slider_max,
-                                              slider_value, icon_paths, heights, widths, text_sizes, count);
-    if (slot < 0 || slot >= PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE) return 0;
-
-    for (int i = 0; i < plugin_settings_list_row_counts[slot]; i++) {
-        if (plugin_settings_list_rows[slot][i].L) {
-            luaL_unref(plugin_settings_list_rows[slot][i].L, LUA_REGISTRYINDEX,
-                       plugin_settings_list_rows[slot][i].callback_ref);
-        }
-    }
-    for (int i = 0; i < count; i++) {
-        plugin_settings_list_rows[slot][i].L = L;
-        plugin_settings_list_rows[slot][i].callback_ref = new_refs[i];
-    }
-    plugin_settings_list_row_counts[slot] = count;
-
-    return 0;
-}
-
-static int l_plugin_list_dir(lua_State * L) {
-    const char * path = check_plugin_external_path(L, 1, "plugin.list_dir");
-    lua_newtable(L);
-
-    DIR * d = opendir(path);
-    if (!d) return 1;
-
-    int idx = 1;
-    struct dirent * ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
-
-        char full[1024];
-        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
-        struct stat st;
-        bool is_dir = false;
-        if (stat(full, &st) == 0) is_dir = S_ISDIR(st.st_mode);
-
-        lua_newtable(L);
-        lua_pushstring(L, ent->d_name);
-        lua_setfield(L, -2, "name");
-        lua_pushboolean(L, is_dir);
-        lua_setfield(L, -2, "dir");
-        lua_rawseti(L, -2, idx++);
-    }
-    closedir(d);
-    return 1;
-}
-
-static int l_plugin_sd_root(lua_State * L) {
-    lua_pushstring(L, MUSIC_ROOT_DIR);
-    return 1;
-}
-
-static int l_plugin_mkdir(lua_State * L) {
-    const char * path = check_plugin_external_path(L, 1, "plugin.mkdir");
-    size_t len = strlen(path);
-    if (len == 0 || len >= PATH_MAX) {
-        lua_pushnil(L);
-        lua_pushstring(L, "invalid path");
-        return 2;
-    }
-
-    char buf[PATH_MAX];
-    memcpy(buf, path, len + 1);
-    while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
-
-    for (size_t i = 1; i <= len; i++) {
-        if (buf[i] != '/' && buf[i] != '\0') continue;
-        char saved = buf[i];
-        buf[i] = '\0';
-        if (buf[0] != '\0' && mkdir(buf, 0755) != 0) {
-            int saved_errno = errno;
-            struct stat st;
-            if (saved_errno != EEXIST || stat(buf, &st) != 0 || !S_ISDIR(st.st_mode)) {
-                buf[i] = saved;
-                lua_pushnil(L);
-                lua_pushstring(L, strerror(saved_errno));
-                return 2;
-            }
-        }
-        buf[i] = saved;
-    }
-
-    lua_pushboolean(L, true);
-    return 1;
-}
-
-static int l_plugin_play_file(lua_State * L) {
-    const char * path = check_plugin_external_path(L, 1, "plugin.play_file");
-    gui_plugin_play_paths(&path, 1, 0);
-    return 0;
-}
-
-static int l_plugin_play_list(lua_State * L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    int start = (int) luaL_optinteger(L, 2, 1) - 1;
-
-    lua_Unsigned raw_n = lua_rawlen(L, 1);
-    int n = (raw_n > (lua_Unsigned) PLUGIN_MAX_LIST_ITEMS) ? PLUGIN_MAX_LIST_ITEMS : (int) raw_n;
-    if (n <= 0) return 0;
-    if (start < 0) start = 0;
-    if (start >= n) start = n - 1;
-
-    static char path_bufs[PLUGIN_MAX_LIST_ITEMS][512];
-    static const char * paths[PLUGIN_MAX_LIST_ITEMS];
-    for (int i = 0; i < n; i++) {
-        lua_rawgeti(L, 1, i + 1);
-        const char * s = lua_tostring(L, -1);
-        if (s && plugin_storage_path_is_reserved(s)) {
-            lua_pop(L, 1);
-            return luaL_error(L, "plugin.play_list: path is reserved for plugin.storage/plugin.secrets");
-        }
-        snprintf(path_bufs[i], sizeof(path_bufs[i]), "%s", s ? s : "");
-        paths[i] = path_bufs[i];
-        lua_pop(L, 1);
-    }
-
-    gui_plugin_play_paths(paths, n, start);
-    return 0;
-}
-
-static lua_Number check_bounded_number(lua_State * L, int table_index, const char * field, const char * fn_name, lua_Number max_value) {
-    lua_getfield(L, table_index, field);
-    lua_Number val = luaL_optnumber(L, -1, 0);
-    lua_pop(L, 1);
-    if (!(val >= 0) || !(val <= max_value)) {
-        luaL_error(L, "%s: %s must be a finite number between 0 and %.0f", fn_name, field, (double) max_value);
-    }
-    return val;
-}
-
-static void parse_remote_track_table(lua_State * L, int table_index, remote_track_meta_t * out, const char * fn_name) {
-    memset(out, 0, sizeof(*out));
-
-    lua_getfield(L, table_index, "provider");
-    const char * provider = luaL_checkstring(L, -1);
-    if (provider[0] == '\0') luaL_error(L, "%s: provider must not be empty", fn_name);
-    if (strlen(provider) >= sizeof(out->provider)) luaL_error(L, "%s: provider is too long", fn_name);
-    snprintf(out->provider, sizeof(out->provider), "%s", provider);
-    lua_pop(L, 1);
-
-    lua_getfield(L, table_index, "track_id");
-    const char * track_id = luaL_checkstring(L, -1);
-    if (track_id[0] == '\0') luaL_error(L, "%s: track_id must not be empty", fn_name);
-    if (strlen(track_id) >= sizeof(out->track_id)) luaL_error(L, "%s: track_id is too long", fn_name);
-    snprintf(out->track_id, sizeof(out->track_id), "%s", track_id);
-    lua_pop(L, 1);
-
-    {
-        char key[256];
-        if (!remote_track_make_key(out->provider, out->track_id, key, sizeof(key))) {
-            luaL_error(L, "%s: provider/track_id must not contain '/' or control characters, and must fit the synthetic key", fn_name);
-        }
-    }
-
-    lua_getfield(L, table_index, "stream_url");
-    const char * stream_url = luaL_checkstring(L, -1);
-    if (stream_url[0] == '\0') luaL_error(L, "%s: stream_url must not be empty", fn_name);
-    if (strlen(stream_url) >= sizeof(out->stream_url)) luaL_error(L, "%s: stream_url is too long", fn_name);
-    snprintf(out->stream_url, sizeof(out->stream_url), "%s", stream_url);
-    lua_pop(L, 1);
-
-#define OPT_STR_FIELD(field, name) \
-    lua_getfield(L, table_index, name); \
-    const char * field##_val = luaL_optstring(L, -1, ""); \
-    if (strlen(field##_val) >= sizeof(out->field)) luaL_error(L, "%s: " name " is too long", fn_name); \
-    snprintf(out->field, sizeof(out->field), "%s", field##_val); \
-    lua_pop(L, 1);
-
-    OPT_STR_FIELD(title, "title")
-    OPT_STR_FIELD(artist, "artist")
-    OPT_STR_FIELD(album, "album")
-    OPT_STR_FIELD(artwork_url, "artwork_url")
-#undef OPT_STR_FIELD
-
-    lua_getfield(L, table_index, "codec");
-    const char * codec_val = luaL_optstring(L, -1, "");
-    if (codec_val[0] != '\0' && strcasecmp(codec_val, "mp3") != 0 && strcasecmp(codec_val, "flac") != 0 &&
-        strcasecmp(codec_val, "aac") != 0) {
-        luaL_error(L, "%s: unknown codec '%s' -- must be \"mp3\", \"flac\", \"aac\", or omitted", fn_name, codec_val);
-    }
-    if (strlen(codec_val) >= sizeof(out->codec)) luaL_error(L, "%s: codec is too long", fn_name);
-    snprintf(out->codec, sizeof(out->codec), "%s", codec_val);
-    lua_pop(L, 1);
-
-    out->duration_ms = (uint32_t) check_bounded_number(L, table_index, "duration_ms", fn_name, 24.0 * 3600.0 * 1000.0);
-    out->sample_rate = (unsigned int) check_bounded_number(L, table_index, "sample_rate", fn_name, 1000000.0);
-    out->bit_depth = (unsigned int) check_bounded_number(L, table_index, "bit_depth", fn_name, 64.0);
-    out->channels = (unsigned int) check_bounded_number(L, table_index, "channels", fn_name, 64.0);
-    out->bitrate_kbps = (unsigned int) check_bounded_number(L, table_index, "bitrate_kbps", fn_name, 100000.0);
-
-    lua_getfield(L, table_index, "replaygain_db");
-    if (!lua_isnil(L, -1)) {
-        double gain = luaL_checknumber(L, -1);
-        if (!(gain >= -100.0 && gain <= 100.0)) luaL_error(L, "%s: replaygain_db must be a finite number between -100 and 100", fn_name);
-        out->has_replaygain = true;
-        out->replaygain_db = gain;
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, table_index, "verify_tls");
-    out->verify_tls = lua_isnil(L, -1) ? true : lua_toboolean(L, -1);
-    lua_pop(L, 1);
-}
-
-static int l_plugin_play_remote(lua_State * L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    remote_track_meta_t track;
-    parse_remote_track_table(L, 1, &track, "plugin.play_remote");
-    gui_plugin_play_remote_tracks(&track, 1, 0);
-    return 0;
-}
-
-static int l_plugin_queue_remote_list(lua_State * L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    int start = (int) luaL_optinteger(L, 2, 1) - 1;
-
-    lua_Unsigned raw_n = lua_rawlen(L, 1);
-    int n = (raw_n > (lua_Unsigned) PLUGIN_MAX_LIST_ITEMS) ? PLUGIN_MAX_LIST_ITEMS : (int) raw_n;
-    if (n <= 0) return 0;
-    if (start < 0) start = 0;
-    if (start >= n) start = n - 1;
-
-    remote_track_meta_t * tracks = (remote_track_meta_t *) lua_newuserdata(L, sizeof(remote_track_meta_t) * (size_t) n);
-    for (int i = 0; i < n; i++) {
-        lua_rawgeti(L, 1, i + 1);
-        luaL_checktype(L, -1, LUA_TTABLE);
-        parse_remote_track_table(L, lua_gettop(L), &tracks[i], "plugin.queue_remote_list");
-        lua_pop(L, 1);
-    }
-
-    gui_plugin_play_remote_tracks(tracks, n, start);
-    return 0;
-}
-
-static int l_plugin_show_toast(lua_State * L) {
-    const char * msg = luaL_checkstring(L, 1);
-    lua_Integer duration_ms = luaL_optinteger(L, 2, 5000);
-    if (duration_ms < 100 || duration_ms > 30000)
-        return luaL_error(L, "plugin.show_toast: duration_ms must be between 100 and 30000");
-    gui_plugin_show_toast(msg, (uint32_t) duration_ms);
-    return 0;
-}
-
-#ifndef HOST_BUILD
-static bool files_identical(const char * a_path, const char * b_path) {
-    struct stat sa, sb;
-    if (stat(a_path, &sa) != 0 || stat(b_path, &sb) != 0) return false;
-    if (!S_ISREG(sa.st_mode) || !S_ISREG(sb.st_mode)) return false;
-    if (sa.st_size != sb.st_size) return false;
-
-    FILE * a = fopen(a_path, "rb");
-    FILE * b = fopen(b_path, "rb");
-    if (!a || !b) {
-        if (a) fclose(a);
-        if (b) fclose(b);
+/* audio_mutex must be held. Setup failures retain the target but are
+ * retried only after a delay, preventing a low-memory failure from turning
+ * the playback loop into an allocation/thread-creation spin. */
+static bool request_mp3_seek_index_locked(const decoder_t * dec, const char * path,
+                                          uint64_t generation) {
+    if (dec->mp3_seek_index_attempted) {
+        finish_mp3_deferred_seek_locked();
         return false;
     }
+    if (mp3_index_worker_active || mp3_index_result) return true;
+    if (monotonic_ms() < mp3_seek_retry_after_ms) return true;
 
-    char ba[4096], bb[4096];
-    bool same = true;
-    for (;;) {
-        size_t na = fread(ba, 1, sizeof(ba), a);
-        size_t nb = fread(bb, 1, sizeof(bb), b);
-        if (na != nb || memcmp(ba, bb, na) != 0) {
-            same = false;
-            break;
-        }
-        if (na == 0) break;
+    uint64_t interval = (uint64_t) dec->sample_rate * MP3_SEEK_INDEX_INTERVAL_SECONDS;
+    uint64_t desired = dec->total_frames / interval;
+    if (desired < 2) {
+        finish_mp3_deferred_seek_locked();
+        return false;
     }
-    if (ferror(a) || ferror(b)) same = false;
-    fclose(a);
-    fclose(b);
-    return same;
+    if (desired > MP3_SEEK_INDEX_MAX_POINTS) desired = MP3_SEEK_INDEX_MAX_POINTS;
+
+    mp3_index_job_t * job = calloc(1, sizeof(*job));
+    if (!job || !(job->path = strdup(path))) {
+        free_mp3_index_job(job);
+        mp3_seek_retry_count++;
+        mp3_seek_retry_after_ms = monotonic_ms() + MP3_SEEK_RETRY_DELAY_MS;
+        DBG_LOG("audio: MP3 seek-index setup allocation failed, retry %u/%u (%s)\n",
+                mp3_seek_retry_count, MP3_SEEK_RETRY_MAX, safe_path_tail(path));
+        if (mp3_seek_retry_count >= MP3_SEEK_RETRY_MAX)
+            finish_mp3_deferred_seek_locked();
+        return mp3_seek_deferred;
+    }
+    job->generation = generation;
+    job->sample_rate = dec->as.mp3->sampleRate;
+    job->channels = dec->as.mp3->channels;
+    job->stream_length = dec->as.mp3->streamLength;
+    job->stream_start_offset = dec->as.mp3->streamStartOffset;
+    job->delay_frames = dec->as.mp3->delayInPCMFrames;
+    job->padding_frames = dec->as.mp3->paddingInPCMFrames;
+    job->count = (drmp3_uint32) desired;
+
+    pthread_t worker;
+    mp3_index_worker_active = true;
+    if (pthread_create(&worker, NULL, mp3_index_worker, job) != 0) {
+        mp3_index_worker_active = false;
+        free_mp3_index_job(job);
+        mp3_seek_retry_count++;
+        mp3_seek_retry_after_ms = monotonic_ms() + MP3_SEEK_RETRY_DELAY_MS;
+        DBG_LOG("audio: MP3 seek-index worker start failed, retry %u/%u (%s)\n",
+                mp3_seek_retry_count, MP3_SEEK_RETRY_MAX, safe_path_tail(path));
+        if (mp3_seek_retry_count >= MP3_SEEK_RETRY_MAX)
+            finish_mp3_deferred_seek_locked();
+        return mp3_seek_deferred;
+    }
+    pthread_detach(worker);
+    return true;
 }
 
-static bool copy_file(const char * src_path, const char * dst_path) {
-    if (files_identical(src_path, dst_path)) return true;
-    FILE * in = fopen(src_path, "rb");
-    if (!in) return false;
-    char tmp_path[640];
-    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", dst_path, (long) getpid()) >= (int) sizeof(tmp_path)) {
-        fclose(in);
-        return false;
+static audio_codec_t public_codec_for_decoder(decoder_type_t type) {
+    switch (type) {
+        case DECODER_FLAC: return AUDIO_CODEC_FLAC;
+        case DECODER_MP3: return AUDIO_CODEC_MP3;
+        case DECODER_WAV:
+        case DECODER_AIFF: return AUDIO_CODEC_PCM;
+        case DECODER_DSD: return AUDIO_CODEC_DSD;
+        case DECODER_AAC: return AUDIO_CODEC_AAC;
+        case DECODER_ALAC: return AUDIO_CODEC_ALAC;
+        case DECODER_APE: return AUDIO_CODEC_APE;
+        case DECODER_WMA: return AUDIO_CODEC_WMA;
+        case DECODER_OPUS: return AUDIO_CODEC_OPUS;
+        case DECODER_VORBIS: return AUDIO_CODEC_VORBIS;
     }
-    FILE * out = fopen(tmp_path, "wb");
-    if (!out) {
-        fclose(in);
-        return false;
-    }
+    return AUDIO_CODEC_UNKNOWN;
+}
 
-    bool ok = true;
-    char buf[65536];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) {
-            ok = false;
-            break;
+/* audio_mutex must be held. Publishing a copied scalar snapshot here keeps
+ * the UI completely independent from the playback thread's stack-local
+ * decoder_t and its short-lived gapless/crossfade prefetched decoder. */
+static void publish_current_format_locked(const decoder_t * dec, const char * path,
+                                          float replaygain_linear, bool replaygain_applied) {
+    memset(&current_format_info, 0, sizeof(current_format_info));
+    current_format_info.valid = true;
+    if (path) snprintf(current_format_info.path, sizeof(current_format_info.path), "%s", path);
+    current_format_info.codec = public_codec_for_decoder(dec->type);
+    current_format_info.source_sample_rate = dec->source_sample_rate ? dec->source_sample_rate : dec->sample_rate;
+    current_format_info.source_bit_depth = dec->source_bit_depth;
+    current_format_info.output_sample_rate = dec->sample_rate;
+    current_format_info.output_bit_depth = 16; /* decoder_read_s16() -> S16_LE on every output route */
+    current_format_info.channels = dec->channels;
+    current_format_info.bitrate_kbps = dec->bitrate_kbps;
+    current_format_info.duration_seconds = dec->sample_rate > 0 && dec->total_frames > 0
+        ? (double) dec->total_frames / (double) dec->sample_rate : 0.0;
+    current_format_info.is_stream = dec->net_stream != NULL;
+    current_format_info.is_dsd = dec->type == DECODER_DSD;
+    current_format_info.replaygain_applied = replaygain_applied;
+    current_format_info.replaygain_applied_db = replaygain_applied && replaygain_linear > 0.0f
+        ? 20.0 * log10((double) replaygain_linear) : 0.0;
+    current_format_info.generation = ++current_format_generation;
+}
+
+static void clear_current_format_locked(void) {
+    memset(&current_format_info, 0, sizeof(current_format_info));
+    current_format_generation++;
+}
+
+#ifdef HOST_BUILD
+static SDL_AudioDeviceID sdl_dev = 0;
+static unsigned int device_channels = 0;
+static unsigned int device_sample_rate = 0;
+#endif
+
+static double replaygain_to_linear(bool has_gain, double gain_db, bool has_peak, double peak) {
+    double linear = has_gain ? pow(10.0, gain_db / 20.0) : 1.0;
+    if (has_peak && peak > 0.0) {
+        double max_linear = 1.0 / peak; /* clamp so the loudest sample can't clip */
+        if (linear > max_linear) linear = max_linear;
+    }
+    /* Belt-and-suspenders alongside metadata.c's own parse_replaygain_gain()/
+     * _peak() range limits: those already reject an absurd-but-finite
+     * gain_db (e.g. a corrupted "1e308" tag) before it ever reaches this
+     * function, but this is the one real choke point every gain value from
+     * every tag format/call site funnels through before apply_gain()'s
+     * lrintf() -- cheap enough to guard here too rather than trust every
+     * current and future caller to have validated its own inputs. Falls
+     * back to unity (no gain change) rather than propagating a non-finite
+     * value into raw sample math. */
+    if (!isfinite(linear)) linear = 1.0;
+    return linear;
+}
+
+/* Real-device feedback: "noticeable sound hissing in quiet songs, not
+ * related to the files (same songs sound clean in the stock player)".
+ * Root cause: a plain `(int32_t) (float)` cast truncates toward zero
+ * rather than rounding to the nearest integer, and it did so on every
+ * single sample at every non-unity gain (which is almost always -- see
+ * audio_set_volume()'s own comment, true silence is the only exact
+ * 1.0x). For a quiet passage, sample magnitudes are already small, so
+ * truncation's bias (always toward zero, i.e. always down in magnitude)
+ * is a large fraction of the sample's own value rather than a rounding
+ * error a full dynamic-range signal would completely mask -- exactly the
+ * classic naive-gain-scaling recipe for audible quantization
+ * distortion/hiss. lrintf() rounds to the nearest representable integer
+ * (ties to even) instead of always truncating down. */
+static void apply_gain(int16_t * buf, size_t sample_count, float gain) {
+    /* Fast path: no scaling needed. A positive ReplayGain adjustment can
+     * push this above 1.0f, so this can't just be ">= 0.999f". */
+    if (gain > 0.999f && gain < 1.001f) return;
+    for (size_t i = 0; i < sample_count; i++) {
+        long scaled = lrintf((float) buf[i] * gain);
+        if (scaled > 32767) scaled = 32767;
+        if (scaled < -32768) scaled = -32768;
+        buf[i] = (int16_t) scaled;
+    }
+}
+
+/* Closes and reopens a local decoder at last_confirmed_frame.
+ * Only valid for finite local files (not net_stream). Returns true on
+ * success; on failure dec is left in a closed/invalid state. */
+static bool reopen_decoder_at(decoder_t * dec, const char * path,
+                               uint64_t last_confirmed_frame) {
+    drmp3_seek_point * saved_mp3_points = dec->mp3_seek_points;
+    drmp3_uint32 saved_mp3_count = dec->mp3_seek_point_count;
+    unsigned int saved_mp3_rate = saved_mp3_points ? dec->as.mp3->sampleRate : 0;
+    unsigned int saved_mp3_channels = saved_mp3_points ? dec->as.mp3->channels : 0;
+    uint64_t saved_mp3_length = saved_mp3_points ? dec->as.mp3->streamLength : 0;
+    uint64_t saved_mp3_offset = saved_mp3_points ? dec->as.mp3->streamStartOffset : 0;
+    uint32_t saved_mp3_delay = saved_mp3_points ? dec->as.mp3->delayInPCMFrames : 0;
+    uint32_t saved_mp3_padding = saved_mp3_points ? dec->as.mp3->paddingInPCMFrames : 0;
+    dec->mp3_seek_points = NULL;
+    dec->mp3_seek_point_count = 0;
+    decoder_close(dec);
+    if (!decoder_open(dec, path)) {
+        free(saved_mp3_points);
+        return false;
+    }
+    if (saved_mp3_points) {
+        if (dec->type != DECODER_MP3 ||
+            dec->as.mp3->sampleRate != saved_mp3_rate ||
+            dec->as.mp3->channels != saved_mp3_channels ||
+            dec->as.mp3->streamLength != saved_mp3_length ||
+            dec->as.mp3->streamStartOffset != saved_mp3_offset ||
+            dec->as.mp3->delayInPCMFrames != saved_mp3_delay ||
+            dec->as.mp3->paddingInPCMFrames != saved_mp3_padding ||
+            !drmp3_bind_seek_table(dec->as.mp3, saved_mp3_count, saved_mp3_points)) {
+            free(saved_mp3_points);
+            decoder_close(dec);
+            return false;
+        }
+        dec->mp3_seek_points = saved_mp3_points;
+        dec->mp3_seek_point_count = saved_mp3_count;
+        dec->mp3_seek_index_attempted = true;
+    }
+    if (last_confirmed_frame > 0) {
+        if (!decoder_seek(dec, last_confirmed_frame)) {
+            decoder_close(dec);
+            return false;
         }
     }
-    ok = ok && !ferror(in);
-    fclose(in);
-    if (fclose(out) != 0) ok = false;
+    return true;
+}
 
-    if (ok) ok = rename(tmp_path, dst_path) == 0;
-    if (!ok) remove(tmp_path);
+#ifdef HOST_BUILD
+static bool open_device(unsigned int channels, unsigned int sample_rate) {
+    SDL_AudioSpec want, have;
+    SDL_zero(want);
+    want.freq = (int) sample_rate;
+    want.format = AUDIO_S16SYS;
+    want.channels = (Uint8) channels;
+    want.samples = NORMAL_CHUNK_FRAMES;
+
+    sdl_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (sdl_dev == 0) {
+        fprintf(stderr, "audio: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+        return false;
+    }
+    SDL_PauseAudioDevice(sdl_dev, 0);
+    device_channels = channels;
+    device_sample_rate = sample_rate;
+    return true;
+}
+
+static void close_device(void) {
+    if (sdl_dev != 0) { SDL_CloseAudioDevice(sdl_dev); sdl_dev = 0; }
+    device_channels = 0;
+    device_sample_rate = 0;
+}
+
+static bool ensure_device(unsigned int channels, unsigned int sample_rate) {
+    bool device_open = (sdl_dev != 0);
+    if (device_open && device_channels == channels && device_sample_rate == sample_rate) return true;
+    close_device();
+    return open_device(channels, sample_rate);
+}
+
+static void write_device(const int16_t * buf, uint64_t frames, unsigned int channels) {
+    SDL_QueueAudio(sdl_dev, buf, (Uint32) (frames * channels * sizeof(int16_t)));
+
+    /* Throttle so the decode loop doesn't race ahead and queue the whole file at once */
+    Uint32 max_queued_bytes = device_sample_rate * channels * sizeof(int16_t);
+    while (SDL_GetQueuedAudioSize(sdl_dev) > max_queued_bytes) {
+        pthread_mutex_lock(&audio_mutex);
+        bool stop_now = stop_requested || restart_requested;
+        pthread_mutex_unlock(&audio_mutex);
+        if (stop_now) break;
+        usleep(10000);
+    }
+}
+#else
+/* Target build: thin wrappers around the shared audio_output module (see
+ * audio_output.h and its own top-of-file comment) -- all the actual
+ * local-hardware-vs-Bluetooth routing, pacing, and failure-handling logic
+ * that used to live here directly now lives there instead, shared with
+ * usb_dac_bridge.c's own separate output stream. */
+static bool ensure_device(unsigned int channels, unsigned int sample_rate) {
+    /* Decoder-fed local playback wants the standard, battery-tuned local
+     * buffer, not the low-latency one AirPlay's own audio_output_ensure()
+     * call requests -- see that parameter's own doc comment. */
+    bool ok = audio_output_ensure(channels, sample_rate, false);
+    if (ok) {
+        /* Real-device bug report: USB headphones had volume maxed out on
+         * first boot no matter what the UI showed, only "fixed" by
+         * pressing vol+/-. Root cause: audio_set_volume()'s USB
+         * digital-taper branch (see its own comment) depends on
+         * audio_output_is_usb_active(), which only reflects the truth once
+         * open_device() has actually run for the current track -- any
+         * audio_set_volume() call made before that (e.g. applying the
+         * saved volume right after boot, before anything has ever played)
+         * always sees it as false, pinning volume_gain at unity even
+         * though the eventual real target is USB. Nothing re-derived it
+         * once the real target became known. Re-checking here, right after
+         * every ensure_device() call (already invoked every decode chunk
+         * for the same class of target-changed-mid-stream reason -- see
+         * this function's own caller comment on Bluetooth), and only
+         * re-deriving on an actual change costs nothing extra the rest of
+         * the time. */
+        static bool last_gain_for_usb = false;
+        bool now_usb = audio_output_is_usb_active();
+        if (now_usb != last_gain_for_usb) {
+            audio_set_volume(audio_get_volume());
+            last_gain_for_usb = now_usb;
+        }
+    }
     return ok;
 }
 
-static void set_home_background_image(lua_State * L, const char * source_path, home_layout_config_t * config) {
-    const char * dot = strrchr(source_path, '.');
-    const char * ext = NULL;
-    if (dot && strcasecmp(dot, ".png") == 0) ext = ".png";
-    else if (dot && strcasecmp(dot, ".jpg") == 0) ext = ".jpg";
-    else if (dot && strcasecmp(dot, ".jpeg") == 0) ext = ".jpeg";
-    if (!ext) {
-        luaL_error(L, "plugin.set_home_layout: options.background_image '%s' must be a .png, .jpg, or .jpeg file",
-                   source_path);
-        return;
-    }
-
-    char relative_path[32];
-    snprintf(relative_path, sizeof(relative_path), "home/background%s", ext);
-    char dst_path[600];
-    snprintf(dst_path, sizeof(dst_path), "%s%s", PLUGIN_THEME_OVERRIDE_ROOT, relative_path);
-
-    mkdir(PLUGIN_THEME_OVERRIDE_ROOT, 0755);
-    char dir_only[600];
-    snprintf(dir_only, sizeof(dir_only), "%shome", PLUGIN_THEME_OVERRIDE_ROOT);
-    mkdir(dir_only, 0755);
-
-    if (!copy_file(source_path, dst_path)) {
-        luaL_error(L, "plugin.set_home_layout: could not copy options.background_image '%s' to '%s'",
-                   source_path, relative_path);
-        return;
-    }
-
-    snprintf(config->background_image, sizeof(config->background_image), "%s", relative_path);
-    config->has_background_image = true;
+static void close_device(void) {
+    audio_output_close();
 }
-#endif
 
-static int l_plugin_set_icon(lua_State * L) {
-    const char * relative_path = luaL_checkstring(L, 1);
-    const char * source_path = check_plugin_external_path(L, 2, "plugin.set_icon");
+
+/* Writes a PCM batch to the output device with bounded close+reopen
+ * retries. Returns true when all frames were successfully delivered.
+ * Checks stop/restart between retries so the playback thread stays
+ * controllable, unless allow_during_stop_restart is true for controlled
+ * transition ramps (e.g. pause/stop/seek ramp-downs before powering down).
+ * Tracks exact delivered frame count to avoid replaying audio on retry.
+ *
+ * Target build only: the HOST_BUILD SDL path uses write_device() directly
+ * (SDL never needs close+reopen recovery the way tinyalsa/aplay can). */
+#define OUTPUT_WRITE_RETRIES 3
+#define OUTPUT_WRITE_RETRY_SLEEP_US 20000  /* 20 ms */
+
+static write_result_t write_device_with_retry_ex(const int16_t * buf, uint64_t frames,
+                                                unsigned int channels,
+                                                unsigned int sample_rate,
+                                                const char * path,
+                                                uint64_t * out_delivered_frames,
+                                                bool allow_during_stop_restart) {
+    uint64_t delivered = 0;
+    if (out_delivered_frames) *out_delivered_frames = 0;
+
+    for (int attempt = 0; attempt <= OUTPUT_WRITE_RETRIES; attempt++) {
+        pthread_mutex_lock(&audio_mutex);
+        bool abort = should_abort_write_retry(allow_during_stop_restart, stop_requested, restart_requested);
+        pthread_mutex_unlock(&audio_mutex);
+        if (abort) {
+            if (out_delivered_frames) *out_delivered_frames = delivered;
+            return WRITE_RESULT_ABORTED;
+        }
+
+        if (attempt > 0) {
+            close_device();
+            usleep(OUTPUT_WRITE_RETRY_SLEEP_US);
+            if (!ensure_device(channels, sample_rate)) {
+                DBG_LOG("audio: output reopen failed on retry %d (%s)\n",
+                        attempt, safe_path_tail(path));
+                continue;
+            }
+            DBG_LOG("audio: output reopened for retry %d (%s)\n",
+                    attempt, safe_path_tail(path));
+        }
+
+        const int16_t * cur_buf = buf + (size_t) (delivered * channels);
+        uint64_t remaining_frames = frames - delivered;
+        uint64_t written_this_call = 0;
+        bool ok = audio_output_write(cur_buf, remaining_frames, channels, &written_this_call);
+        delivered += written_this_call;
+        if (out_delivered_frames) *out_delivered_frames = delivered;
+
+        if (ok || delivered >= frames) return WRITE_RESULT_OK;
+
+        DBG_LOG("audio: output write failed attempt %d/%d (delivered %" PRIu64 "/%" PRIu64 " frames) (%s)\n",
+                attempt + 1, OUTPUT_WRITE_RETRIES + 1, delivered, frames, safe_path_tail(path));
+    }
+    DBG_LOG("audio: output recovery exhausted (%s)\n", safe_path_tail(path));
+    if (out_delivered_frames) *out_delivered_frames = delivered;
+    return WRITE_RESULT_FAILED;
+}
+
+static inline write_result_t write_device_with_retry(const int16_t * buf, uint64_t frames,
+                                                     unsigned int channels,
+                                                     unsigned int sample_rate,
+                                                     const char * path,
+                                                     uint64_t * out_delivered_frames) {
+    return write_device_with_retry_ex(buf, frames, channels, sample_rate, path, out_delivered_frames, false);
+}
+
+static inline write_result_t write_device_transition_ramp(const int16_t * buf, uint64_t frames,
+                                                          unsigned int channels,
+                                                          unsigned int sample_rate,
+                                                          const char * path,
+                                                          uint64_t * out_delivered_frames) {
+    return write_device_with_retry_ex(buf, frames, channels, sample_rate, path, out_delivered_frames, true);
+}
+#endif /* !HOST_BUILD */
+
+static void close_decoder_if_open(decoder_t * dec, bool * is_open) {
+    if (*is_open) { decoder_close(dec); *is_open = false; }
+}
+
+/* Mixes n frames of buf_cur/buf_next into buf_out with a linear crossfade.
+ * fade_start_frame is how many frames into the CROSSFADE_SECONDS window
+ * this chunk's first frame falls, so the fade is continuous across chunk
+ * boundaries rather than stepped. */
+static void mix_crossfade(const int16_t * buf_cur, const int16_t * buf_next, int16_t * buf_out,
+                           uint64_t n, unsigned int channels, uint64_t fade_start_frame, uint64_t crossfade_frames) {
+    for (uint64_t k = 0; k < n; k++) {
+        float fade_next = (float) (fade_start_frame + k) / (float) crossfade_frames;
+        if (fade_next > 1.0f) fade_next = 1.0f;
+        if (fade_next < 0.0f) fade_next = 0.0f;
+        float fade_cur = 1.0f - fade_next;
+        for (unsigned int ch = 0; ch < channels; ch++) {
+            size_t idx = (size_t) k * channels + ch;
+            float mixed = (float) buf_cur[idx] * fade_cur + (float) buf_next[idx] * fade_next;
+            if (mixed > 32767.0f) mixed = 32767.0f;
+            if (mixed < -32768.0f) mixed = -32768.0f;
+            buf_out[idx] = (int16_t) mixed;
+        }
+    }
+}
+
+static void * audio_thread_func(void * arg) {
+    (void) arg;
+
+    decoder_t cur_dec;
+    bool cur_open = false;
+    char * cur_path_local = NULL;
+    uint64_t cur_frames_played_local = 0;
+    float cur_replaygain_linear = 1.0f;
+    bool cur_replaygain_applied = false;
+
+    decoder_t nxt_dec;
+    bool nxt_open = false;
+    bool nxt_format_matches = false;
+    float nxt_replaygain_linear_local = 1.0f;
+    bool nxt_replaygain_applied_local = false;
+    uint64_t nxt_frames_consumed = 0;
+
+    int16_t * buf_cur = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
+    int16_t * buf_next = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
+    int16_t * buf_out = malloc((size_t) MAX_CHUNK_FRAMES * MAX_CHANNELS * sizeof(int16_t));
 
 #ifndef HOST_BUILD
-    if (relative_path[0] == '/' || strstr(relative_path, "..") != NULL) {
-        return luaL_error(L, "plugin.set_icon: relative_path must be a plain path under the theme root, got '%s'",
-                           relative_path);
-    }
-
-    char dst_path[600];
-    snprintf(dst_path, sizeof(dst_path), "%s%s", PLUGIN_THEME_OVERRIDE_ROOT, relative_path);
-
-    mkdir(PLUGIN_THEME_OVERRIDE_ROOT, 0755);
-    char dir_only[600];
-    snprintf(dir_only, sizeof(dir_only), "%s", dst_path);
-    char * slash = strrchr(dir_only, '/');
-    if (slash) {
-        *slash = '\0';
-        mkdir(dir_only, 0755);
-    }
-
-    if (!copy_file(source_path, dst_path)) {
-        return luaL_error(L, "plugin.set_icon: could not copy '%s' to '%s'", source_path, relative_path);
-    }
-#else
-    (void) source_path;
+    /* Real-device bug report: plugging/unplugging headphones or an aux
+     * cable produced an audible pop/static even with NOTHING ever played
+     * this boot (no track loaded, ensure_device() never once called) --
+     * confirmed NOT reproducible on the stock player, and confirmed via a
+     * genuine fresh reboot test (not just residual state from earlier
+     * playback this same boot). See HARDWARE_DRIVERS.md's "Audio subsystem"
+     * section for the full investigation -- an ALSA-mixer-control-based fix
+     * (muting "Mute Output" at startup) was tried and DISPROVEN by direct
+     * testing: that control doesn't hold state from userspace at all on
+     * this driver, under any condition. Root cause instead: this codec's
+     * driver implements the standard ASoC .digital_mute DAI callback, and
+     * the machine driver gates real chip power (cs43131_set_power())
+     * through the standard DAPM bias-level state machine as streams
+     * start/stop -- the SAME mechanism this file's own pause-time pop fix
+     * (close_device() the instant pause is detected, further down this
+     * loop) already relies on, and which HARDWARE_DRIVERS.md confirms is
+     * genuinely effective. A track that's simply never been played yet has
+     * never triggered that stop sequence even once, leaving the codec in
+     * whatever raw state its own boot-time kernel probe left it in --
+     * different from, and apparently less safe than, the state reached by
+     * actually going through a real open-then-close cycle. Priming it once
+     * here, before the very first real track ever loads, puts the codec
+     * through that exact same proven-safe sequence early -- no audio is
+     * written, so this is inaudible in itself. */
+    if (ensure_device(2, 44100)) close_device();
 #endif
-    return 0;
-}
 
-static int l_plugin_set_background_color(lua_State * L) {
-    const char * slot = luaL_checkstring(L, 1);
-    lua_Integer rgb = luaL_checkinteger(L, 2);
-
-    if (strcmp(slot, "screen") != 0 && strcmp(slot, "card") != 0 && strcmp(slot, "list_row") != 0) {
-        return luaL_error(L, "plugin.set_background_color: unknown slot '%s' (expected \"screen\", \"card\", or \"list_row\")",
-                           slot);
-    }
-
-    gui_plugin_set_background_color(slot, (uint32_t) rgb);
-    return 0;
-}
-
-static int l_plugin_set_text_color(lua_State * L) {
-    const char * slot = luaL_checkstring(L, 1);
-    lua_Integer rgb = luaL_checkinteger(L, 2);
-
-    if (strcmp(slot, "primary") != 0 && strcmp(slot, "muted") != 0) {
-        return luaL_error(L, "plugin.set_text_color: unknown slot '%s' (expected \"primary\" or \"muted\")", slot);
-    }
-
-    gui_plugin_set_text_color(slot, (uint32_t) rgb);
-    return 0;
-}
-
-static void get_opt_color_field(lua_State * L, int idx, const char * field, bool * out_has, uint32_t * out_value) {
-    lua_getfield(L, idx, field);
-    if (!lua_isnil(L, -1)) {
-        *out_has = true;
-        *out_value = (uint32_t) luaL_checkinteger(L, -1);
-    }
-    lua_pop(L, 1);
-}
-
-static void get_opt_bool_field(lua_State * L, int idx, const char * field, bool * out_has, bool * out_value) {
-    lua_getfield(L, idx, field);
-    if (!lua_isnil(L, -1)) {
-        *out_has = true;
-        *out_value = lua_toboolean(L, -1);
-    }
-    lua_pop(L, 1);
-}
-
-static int32_t check_int32_field(lua_State * L, lua_Integer value, const char * fn_name, const char * field) {
-    if (value < INT32_MIN || value > INT32_MAX) {
-        return (int32_t) luaL_error(L, "%s: %s (%lld) is out of range", fn_name, field, (long long) value);
-    }
-    return (int32_t) value;
-}
-
-static int l_plugin_set_home_layout(lua_State * L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-
-    home_layout_config_t config;
-    memset(&config, 0, sizeof(config));
-    config.configured = true;
-
-    lua_Unsigned raw_n = lua_rawlen(L, 1);
-    if (raw_n > (lua_Unsigned) HOME_LAYOUT_MAX_TILES) {
-        return luaL_error(L, "plugin.set_home_layout: tiles has %lld entries, more than the %d-tile limit",
-                           (long long) raw_n, HOME_LAYOUT_MAX_TILES);
-    }
-    int n = (int) raw_n;
-    for (int i = 0; i < n; i++) {
-        lua_rawgeti(L, 1, i + 1);
-        if (!lua_istable(L, -1)) {
-            return luaL_error(L, "plugin.set_home_layout: tile %d must be a table", i + 1);
+    for (;;) {
+        /* Idle until there's a track to (re)start. */
+        pthread_mutex_lock(&audio_mutex);
+        while (!restart_requested) {
+            pthread_cond_wait(&audio_cond, &audio_mutex);
         }
+        restart_requested = false;
+        free(cur_path_local);
+        cur_path_local = restart_path; restart_path = NULL; /* ownership transferred */
+        double start_seconds = restart_start_seconds;
+        cur_replaygain_linear = restart_replaygain_linear;
+        cur_replaygain_applied = restart_replaygain_applied;
+        uint64_t cur_generation = playback_generation;
+        pthread_mutex_unlock(&audio_mutex);
 
-        lua_getfield(L, -1, "key");
-        const char * key = lua_tostring(L, -1);
-        if (!key || key[0] == '\0') {
-            return luaL_error(L, "plugin.set_home_layout: tile %d has a missing or empty key", i + 1);
-        }
-        if (strlen(key) >= sizeof(config.tiles[0].key)) {
-            return luaL_error(L, "plugin.set_home_layout: tile %d's key '%s' is too long", i + 1, key);
-        }
-        char key_copy[sizeof(config.tiles[0].key)];
-        snprintf(key_copy, sizeof(key_copy), "%s", key);
-        lua_pop(L, 1);
+        close_decoder_if_open(&nxt_dec, &nxt_open);
+        nxt_format_matches = false;
+        if (cur_open) { decoder_close(&cur_dec); cur_open = false; }
 
-        int idx = -1;
-        for (int t = 0; t < config.tile_count; t++) {
-            if (strcmp(config.tiles[t].key, key_copy) == 0) { idx = t; break; }
+        if (!cur_path_local || !decoder_open(&cur_dec, cur_path_local)) {
+            if (cur_path_local) fprintf(stderr, "audio: failed to open '%s'\n", cur_path_local);
+            pthread_mutex_lock(&audio_mutex);
+            have_current = false;
+            clear_current_format_locked();
+            last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+            last_playback_error_generation = cur_generation;
+            pthread_mutex_unlock(&audio_mutex);
+            continue;
         }
-        if (idx < 0) {
-            if (config.tile_count >= HOME_LAYOUT_MAX_TILES) {
-                return luaL_error(L, "plugin.set_home_layout: too many distinct tile keys (max %d)",
-                                   HOME_LAYOUT_MAX_TILES);
+        cur_open = true;
+        cur_frames_played_local = 0;
+        bool initial_mp3_seek_deferred = false;
+
+        if (!cur_dec.net_stream && isfinite(start_seconds) && start_seconds > 0.0) {
+            double bounded_seconds = start_seconds;
+            double duration_seconds = (double) cur_dec.total_frames / (double) cur_dec.sample_rate;
+            if (bounded_seconds > duration_seconds) bounded_seconds = duration_seconds;
+            uint64_t start_frame = (uint64_t) (bounded_seconds * (double) cur_dec.sample_rate);
+            bool long_mp3 = mp3_needs_seek_index(&cur_dec);
+            if (long_mp3) {
+                pthread_mutex_lock(&audio_mutex);
+                defer_mp3_seek_locked(&cur_dec, cur_generation, start_frame);
+                initial_mp3_seek_deferred = request_mp3_seek_index_locked(
+                    &cur_dec, cur_path_local, cur_generation);
+                pthread_mutex_unlock(&audio_mutex);
             }
-            idx = config.tile_count++;
-            snprintf(config.tiles[idx].key, sizeof(config.tiles[idx].key), "%s", key_copy);
-        }
-        home_tile_override_t * ov = &config.tiles[idx].override;
-        memset(ov, 0, sizeof(*ov));
-        int row_idx = lua_gettop(L);
-
-        get_opt_color_field(L, row_idx, "bg_color", &ov->has_bg_color, &ov->bg_color);
-        get_opt_color_field(L, row_idx, "text_color", &ov->has_text_color, &ov->text_color);
-
-        lua_getfield(L, row_idx, "radius");
-        if (!lua_isnil(L, -1)) {
-            lua_Integer radius = luaL_checkinteger(L, -1);
-            if (radius < 0) {
-                lua_pop(L, 1);
-                return luaL_error(L, "plugin.set_home_layout: tile %d has a negative radius", i + 1);
-            }
-            ov->has_radius = true;
-            ov->radius = check_int32_field(L, radius, "plugin.set_home_layout", "radius");
-        }
-        lua_pop(L, 1);
-
-        lua_getfield(L, row_idx, "height");
-        ov->height = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "height");
-        lua_pop(L, 1);
-
-        lua_getfield(L, row_idx, "width");
-        ov->width = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "width");
-        lua_pop(L, 1);
-
-        lua_getfield(L, row_idx, "align");
-        const char * align = lua_tostring(L, -1);
-        if (align) {
-            if (strcmp(align, "left") != 0 && strcmp(align, "center") != 0 && strcmp(align, "right") != 0) {
-                lua_pop(L, 1);
-                return luaL_error(L, "plugin.set_home_layout: tile %d has an unknown align '%s' "
-                                   "(expected \"left\", \"center\", or \"right\")", i + 1, align);
-            }
-            snprintf(ov->align, sizeof(ov->align), "%s", align);
-        }
-        lua_pop(L, 1);
-
-        get_opt_bool_field(L, row_idx, "accessory", &ov->has_accessory, &ov->accessory);
-        get_opt_bool_field(L, row_idx, "icon", &ov->has_icon, &ov->icon);
-
-        lua_getfield(L, row_idx, "text_size");
-        const char * text_size = lua_tostring(L, -1);
-        if (text_size) {
-            if (!is_valid_text_size(text_size)) {
-                lua_pop(L, 1);
-                return luaL_error(L, "plugin.set_home_layout: tile %d has an unknown text_size '%s' "
-                                   "(expected \"small\", \"medium\", \"large\", or \"mono\")", i + 1, text_size);
-            }
-            snprintf(ov->text_size, sizeof(ov->text_size), "%s", text_size);
-        }
-        lua_pop(L, 1);
-
-        lua_pop(L, 1);
-    }
-
-    if (lua_gettop(L) >= 2 && !lua_isnil(L, 2) && !lua_istable(L, 2)) {
-        return luaL_error(L, "plugin.set_home_layout: options must be a table");
-    }
-    if (lua_gettop(L) >= 2 && lua_istable(L, 2)) {
-        lua_getfield(L, 2, "mode");
-        const char * mode = lua_tostring(L, -1);
-        if (mode) {
-            if (strcmp(mode, "tile") == 0) config.list_mode = false;
-            else if (strcmp(mode, "list") == 0) config.list_mode = true;
-            else {
-                lua_pop(L, 1);
-                return luaL_error(L, "plugin.set_home_layout: unknown mode '%s' (expected \"tile\" or \"list\")", mode);
+            if (initial_mp3_seek_deferred) {
+                DBG_LOG("audio: initial MP3 seek deferred until index is ready (%s)\n",
+                        safe_path_tail(cur_path_local));
+            } else if (long_mp3) {
+                DBG_LOG("audio: initial MP3 seek skipped because its index is unavailable (%s)\n",
+                        safe_path_tail(cur_path_local));
+            } else if (decoder_seek(&cur_dec, start_frame)) {
+                cur_frames_played_local = start_frame;
+            } else {
+                DBG_LOG("audio: initial seek to frame %" PRIu64 " failed (%s), playing from start\n",
+                        start_frame, safe_path_tail(cur_path_local));
+                /* Seeking can mutate a decoder before reporting failure
+                 * (notably AAC and Opus). A clean reopen makes the promised
+                 * start-from-zero fallback real and prevents a bad persisted
+                 * resume position from crashing again on every boot. */
+                if (!reopen_decoder_at(&cur_dec, cur_path_local, 0)) {
+                    cur_open = false;
+                    pthread_mutex_lock(&audio_mutex);
+                    have_current = false;
+                    clear_current_format_locked();
+                    last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                    last_playback_error_generation = cur_generation;
+                    pthread_mutex_unlock(&audio_mutex);
+                    continue;
+                }
+                cur_frames_played_local = 0;
             }
         }
-        lua_pop(L, 1);
 
-        lua_getfield(L, 2, "tile_gap");
-        config.tile_gap = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "tile_gap");
-        lua_pop(L, 1);
-
-        lua_getfield(L, 2, "row_gap");
-        config.row_gap = check_int32_field(L, luaL_optinteger(L, -1, 0), "plugin.set_home_layout", "row_gap");
-        lua_pop(L, 1);
-
+        if (!ensure_device(cur_dec.channels, cur_dec.sample_rate)) {
+            decoder_close(&cur_dec);
+            cur_open = false;
+            pthread_mutex_lock(&audio_mutex);
+            have_current = false;
+            clear_current_format_locked();
+            last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+            last_playback_error_generation = cur_generation;
+            pthread_mutex_unlock(&audio_mutex);
+            continue;
+        }
 #ifndef HOST_BUILD
-        lua_getfield(L, 2, "background_image");
-        if (!lua_isnil(L, -1)) {
-            const char * source_path = check_plugin_external_path(L, -1, "plugin.set_home_layout");
-            set_home_background_image(L, source_path, &config);
-        }
-        lua_pop(L, 1);
+        if (initial_mp3_seek_deferred) close_device();
 #endif
 
-        lua_getfield(L, 2, "order");
-        if (!lua_isnil(L, -1)) {
-            if (!lua_istable(L, -1)) {
-                return luaL_error(L, "plugin.set_home_layout: options.order must be an array table");
-            }
-            lua_Unsigned order_n = lua_rawlen(L, -1);
-            if (order_n > (lua_Unsigned) HOME_LAYOUT_MAX_TILES) {
-                return luaL_error(L, "plugin.set_home_layout: options.order has %lld entries, more than the %d-tile limit",
-                                   (long long) order_n, HOME_LAYOUT_MAX_TILES);
-            }
-            int order_idx = lua_gettop(L);
-            int order_n_int = (int) order_n;
-            for (int i = 0; i < order_n_int; i++) {
-                lua_rawgeti(L, order_idx, i + 1);
-                const char * entry = lua_tostring(L, -1);
-                if (!entry || entry[0] == '\0') {
-                    return luaL_error(L, "plugin.set_home_layout: options.order entry %d must be a non-empty string",
-                                       i + 1);
-                }
-                if (strlen(entry) >= sizeof(config.order[0])) {
-                    return luaL_error(L, "plugin.set_home_layout: options.order entry %d ('%s') is too long",
-                                       i + 1, entry);
-                }
-                for (int j = 0; j < i; j++) {
-                    if (strcmp(config.order[j], entry) == 0) {
-                        return luaL_error(L, "plugin.set_home_layout: options.order has a duplicate entry '%s'", entry);
+        pthread_mutex_lock(&audio_mutex);
+        have_current = true;
+        frames_played = cur_frames_played_local;
+        current_total_frames = cur_dec.total_frames;
+        current_sample_rate = cur_dec.sample_rate;
+        publish_current_format_locked(&cur_dec, cur_path_local,
+                                      cur_replaygain_linear, cur_replaygain_applied);
+        pthread_mutex_unlock(&audio_mutex);
+
+        bool should_restart = false;
+        bool was_stopped = false;
+        bool ended_with_no_next = false;
+        bool need_fade_in = true;
+        bool mp3_seek_output_held = initial_mp3_seek_deferred;
+        unsigned int consecutive_decoder_errors = 0;
+        unsigned int consecutive_nxt_decoder_errors = 0;
+
+        for (;;) {
+            pthread_mutex_lock(&audio_mutex);
+#ifndef HOST_BUILD
+            /* Real-device bug report: plugging/unplugging headphones or an
+             * aux cable produced an audible pop/static -- confirmed NOT
+             * reproducible on the stock player, and not reproducible here
+             * either once actually stopped (close_device() below already
+             * runs then) -- only while paused, with a track still loaded.
+             * Root cause: this loop only ever waited here while paused,
+             * never closing the PCM device (tinyalsa's pcm_open() from
+             * audio_output.c stayed open the whole time, same struct pcm*
+             * live from before the pause), leaving whatever this codec's
+             * own DAPM/amp power state is tied to "playing" energized
+             * indefinitely -- a physical jack insertion/removal on a live,
+             * powered analog path is exactly what produces an audible pop,
+             * confirmed by this app being the only thing different (the
+             * headphone jack and codec hardware are identical either way).
+             * Closed here, the instant a pause is detected -- reopened
+             * automatically by ensure_device() a few lines below once
+             * playback actually resumes, the same lazy reopen it already
+             * does for every other reason the device might be closed. */
+            if (paused && !stop_requested && !restart_requested) {
+                float vol = volume_gain;
+                pthread_mutex_unlock(&audio_mutex);
+                if (!mp3_seek_output_held && cur_open && cur_dec.sample_rate > 0) {
+                    uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+                    decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
+                    if (r_fade.frames > 0) {
+                        apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, cur_replaygain_linear);
+                        peq_process(buf_cur, (size_t) r_fade.frames, (int) cur_dec.channels, cur_dec.sample_rate);
+                        apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, vol);
+                        apply_ramp(buf_cur, r_fade.frames, cur_dec.channels, 1.0f, 0.0f);
+                        uint64_t delivered = 0;
+                        write_device_transition_ramp(buf_cur, r_fade.frames, cur_dec.channels,
+                                                     cur_dec.sample_rate, cur_path_local, &delivered);
+                        cur_frames_played_local += delivered;
                     }
                 }
-                snprintf(config.order[i], sizeof(config.order[i]), "%s", entry);
-                lua_pop(L, 1);
+                close_device();
+                need_fade_in = true;
+                pthread_mutex_lock(&audio_mutex);
             }
-            config.order_count = order_n_int;
-        }
-        lua_pop(L, 1);
+#endif
+            while (paused && !stop_requested && !restart_requested && !seek_pending &&
+                   !mp3_index_result) {
+                pthread_cond_wait(&audio_cond, &audio_mutex);
+            }
+            bool do_stop = stop_requested;
+            bool do_restart = restart_requested;
+            bool do_seek = false;
+            uint64_t seek_frame = 0;
 
-        if (!config.list_mode && config.order_count > 6) {
-            return luaL_error(L, "plugin.set_home_layout: tile mode supports at most 6 tiles (got %d in "
-                               "options.order) -- use { mode = \"list\" } for more", config.order_count);
-        }
-    }
-
-    gui_plugin_set_home_layout(&config);
-    return 0;
-}
-
-static void parse_launcher_menu_layout(lua_State * L, int idx, const char * menu,
-                                       launcher_menu_layout_t * out) {
-    idx = lua_absindex(L, idx);
-    lua_getfield(L, idx, "mode");
-    const char * mode = luaL_optstring(L, -1, "tile");
-    if (strcmp(mode, "tile") != 0 && strcmp(mode, "list") != 0)
-        luaL_error(L, "plugin.set_launcher_layout: %s.mode must be \"tile\" or \"list\"", menu);
-    out->list_mode = strcmp(mode, "list") == 0;
-    lua_pop(L, 1);
-
-    lua_getfield(L, idx, "row_gap");
-    out->row_gap = check_int32_field(L, luaL_optinteger(L, -1, 0),
-                                     "plugin.set_launcher_layout", "row_gap");
-    lua_pop(L, 1);
-    lua_getfield(L, idx, "height");
-    out->height = check_int32_field(L, luaL_optinteger(L, -1, 0),
-                                    "plugin.set_launcher_layout", "height");
-    lua_pop(L, 1);
-    lua_getfield(L, idx, "width");
-    out->width = check_int32_field(L, luaL_optinteger(L, -1, 0),
-                                   "plugin.set_launcher_layout", "width");
-    lua_pop(L, 1);
-
-    get_opt_color_field(L, idx, "bg_color", &out->has_bg_color, &out->bg_color);
-    get_opt_color_field(L, idx, "text_color", &out->has_text_color, &out->text_color);
-    lua_getfield(L, idx, "radius");
-    if (!lua_isnil(L, -1)) {
-        lua_Integer radius = luaL_checkinteger(L, -1);
-        if (radius < 0) luaL_error(L, "plugin.set_launcher_layout: %s.radius cannot be negative", menu);
-        out->has_radius = true;
-        out->radius = check_int32_field(L, radius, "plugin.set_launcher_layout", "radius");
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, idx, "align");
-    const char * align = lua_tostring(L, -1);
-    if (align) {
-        if (strcmp(align, "left") != 0 && strcmp(align, "center") != 0 && strcmp(align, "right") != 0)
-            luaL_error(L, "plugin.set_launcher_layout: %s.align must be left, center, or right", menu);
-        snprintf(out->align, sizeof(out->align), "%s", align);
-    }
-    lua_pop(L, 1);
-    lua_getfield(L, idx, "text_size");
-    const char * text_size = lua_tostring(L, -1);
-    if (text_size) {
-        if (!is_valid_text_size(text_size))
-            luaL_error(L, "plugin.set_launcher_layout: %s.text_size is invalid", menu);
-        snprintf(out->text_size, sizeof(out->text_size), "%s", text_size);
-    }
-    lua_pop(L, 1);
-    get_opt_bool_field(L, idx, "accessory", &out->has_accessory, &out->accessory);
-    get_opt_bool_field(L, idx, "icon", &out->has_icon, &out->icon);
-}
-
-static int l_plugin_set_launcher_layout(lua_State * L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    launcher_layout_config_t config;
-    memset(&config, 0, sizeof(config));
-    const char * names[] = { "music", "stream_media", "wireless" };
-    launcher_menu_layout_t * menus[] = { &config.music, &config.stream_media, &config.wireless };
-    for (int i = 0; i < 3; i++) {
-        lua_getfield(L, 1, names[i]);
-        if (!lua_isnil(L, -1)) {
-            if (!lua_istable(L, -1))
-                return luaL_error(L, "plugin.set_launcher_layout: %s must be a table", names[i]);
-            parse_launcher_menu_layout(L, -1, names[i], menus[i]);
-        }
-        lua_pop(L, 1);
-    }
-    gui_plugin_set_launcher_layout(&config);
-    return 0;
-}
-
-static int l_plugin_reload_ui(lua_State * L) {
-    (void) L;
-    gui_reload_request();
-    return 0;
-}
-
-static int l_plugin_refresh_theme(lua_State * L) {
-    (void) L;
-    gui_theme_refresh_request();
-    return 0;
-}
-
-static int l_plugin_eq_load_profile(lua_State * L) {
-    const char * path = check_plugin_external_path(L, 1, "plugin.eq_load_profile");
-    bool ok = peq_load_from_path(path);
-    if (ok) peq_save();
-    lua_pushboolean(L, ok);
-    return 1;
-}
-
-static int l_plugin_eq_save_profile(lua_State * L) {
-    const char * path = check_plugin_external_path(L, 1, "plugin.eq_save_profile");
-    lua_pushboolean(L, peq_save_to_path(path));
-    return 1;
-}
-
-static int l_plugin_eq_reset(lua_State * L) {
-    (void) L;
-    peq_reset_to_defaults();
-    peq_save();
-    return 0;
-}
-
-static int l_plugin_eq_set_bypass(lua_State * L) {
-    bool enabled = lua_toboolean(L, 1);
-    peq_set_bypass(enabled);
-    peq_save();
-    return 0;
-}
-
-static int l_plugin_eq_set_preamp(lua_State * L) {
-    double db = luaL_checknumber(L, 1);
-    peq_set_preamp_db(db);
-    peq_save();
-    return 0;
-}
-
-static int check_eq_band_index(lua_State * L, int arg) {
-    lua_Integer index = luaL_checkinteger(L, arg);
-    if (index < 1 || index > PEQ_NUM_BANDS) {
-        luaL_error(L, "band index %d out of range (expected 1..%d)", (int) index, PEQ_NUM_BANDS);
-    }
-    return (int) index - 1;
-}
-
-static int l_plugin_eq_set_band(lua_State * L) {
-    int index = check_eq_band_index(L, 1);
-    double freq_hz = luaL_checknumber(L, 2);
-    double gain_db = luaL_checknumber(L, 3);
-    double q = luaL_checknumber(L, 4);
-    peq_set_band(index, freq_hz, gain_db, q);
-    peq_save();
-    return 0;
-}
-
-static int l_plugin_eq_set_band_type(lua_State * L) {
-    int index = check_eq_band_index(L, 1);
-    const char * type = luaL_checkstring(L, 2);
-
-    peq_band_type_t t;
-    if (strcmp(type, "peaking") == 0) t = PEQ_TYPE_PEAKING;
-    else if (strcmp(type, "low_shelf") == 0) t = PEQ_TYPE_LOW_SHELF;
-    else if (strcmp(type, "high_shelf") == 0) t = PEQ_TYPE_HIGH_SHELF;
-    else return luaL_error(L, "plugin.eq_set_band_type: unknown type '%s' (expected \"peaking\", \"low_shelf\", or \"high_shelf\")", type);
-
-    peq_set_band_type(index, t);
-    peq_save();
-    return 0;
-}
-
-static int l_plugin_eq_set_band_enabled(lua_State * L) {
-    int index = check_eq_band_index(L, 1);
-    bool enabled = lua_toboolean(L, 2);
-    peq_set_band_enabled(index, enabled);
-    peq_save();
-    return 0;
-}
-
-static int l_plugin_set_gain(lua_State * L) {
-    const char * mode = luaL_checkstring(L, 1);
-    if (strcmp(mode, "low") == 0) {
-        audio_set_gain_mode(AUDIO_GAIN_LOW);
-    } else if (strcmp(mode, "high") == 0) {
-        audio_set_gain_mode(AUDIO_GAIN_HIGH);
-    } else {
-        return luaL_error(L, "plugin.set_gain: expected \"low\" or \"high\"");
-    }
-    return 0;
-}
-
-static int l_plugin_get_gain(lua_State * L) {
-    switch (audio_get_gain_mode()) {
-        case AUDIO_GAIN_LOW: lua_pushstring(L, "low"); break;
-        case AUDIO_GAIN_HIGH: lua_pushstring(L, "high"); break;
-        default: lua_pushnil(L); break;
-    }
-    return 1;
-}
-
-static int l_plugin_toggle_pause(lua_State * L) {
-    (void) L;
-    gui_plugin_toggle_pause();
-    return 0;
-}
-
-static int l_plugin_stop(lua_State * L) {
-    (void) L;
-    gui_plugin_stop();
-    return 0;
-}
-
-static int l_plugin_next_track(lua_State * L) {
-    (void) L;
-    gui_plugin_next_track();
-    return 0;
-}
-
-static int l_plugin_prev_track(lua_State * L) {
-    (void) L;
-    gui_plugin_prev_track();
-    return 0;
-}
-
-static int l_plugin_seek(lua_State * L) {
-    double seconds = luaL_checknumber(L, 1);
-    gui_plugin_seek(seconds);
-    return 0;
-}
-
-static int l_plugin_set_volume(lua_State * L) {
-    lua_Integer percent = luaL_checkinteger(L, 1);
-    gui_plugin_set_volume((int) percent);
-    return 0;
-}
-
-static int l_plugin_is_playing(lua_State * L) {
-    lua_pushboolean(L, gui_plugin_is_playing());
-    return 1;
-}
-
-static int l_plugin_is_paused(lua_State * L) {
-    lua_pushboolean(L, gui_plugin_is_paused());
-    return 1;
-}
-
-static int l_plugin_get_position(lua_State * L) {
-    lua_pushnumber(L, gui_plugin_get_position_seconds());
-    return 1;
-}
-
-static int l_plugin_get_duration(lua_State * L) {
-    lua_pushnumber(L, gui_plugin_get_duration_seconds());
-    return 1;
-}
-
-static int l_plugin_http_get(lua_State * L) {
-    const char * url = luaL_checkstring(L, 1);
-    bool verify_tls = lua_gettop(L) >= 2 ? lua_toboolean(L, 2) : true;
-
-    int status = 0;
-    uint8_t * body = NULL;
-    size_t body_size = 0;
-    bool ok = http_get_to_buffer(url, verify_tls, &status, &body, &body_size);
-    if (!ok) {
-        lua_pushnil(L);
-        lua_pushstring(L, "network error");
-        return 2;
-    }
-
-    lua_pushinteger(L, status);
-    lua_pushlstring(L, (const char *) body, body_size);
-    free(body);
-    return 2;
-}
-
-static int l_plugin_http_post(lua_State * L) {
-    const char * url = luaL_checkstring(L, 1);
-    size_t body_len = 0;
-    const char * body = luaL_checklstring(L, 2, &body_len);
-    const char * content_type =
-        (lua_gettop(L) >= 3 && !lua_isnil(L, 3)) ? luaL_checkstring(L, 3) : "application/x-www-form-urlencoded";
-    bool verify_tls = lua_gettop(L) >= 4 ? lua_toboolean(L, 4) : true;
-
-    int status = 0;
-    uint8_t * resp_body = NULL;
-    size_t resp_body_size = 0;
-    bool ok = http_post_to_buffer(url, verify_tls, content_type, (const uint8_t *) body, body_len, &status,
-                                   &resp_body, &resp_body_size);
-    if (!ok) {
-        lua_pushnil(L);
-        lua_pushstring(L, "network error");
-        return 2;
-    }
-
-    lua_pushinteger(L, status);
-    lua_pushlstring(L, (const char *) resp_body, resp_body_size);
-    free(resp_body);
-    return 2;
-}
-
-typedef struct {
-    bool active;
-    atomic_bool done;
-    http_cancel_token_t cancel;
-    uint16_t generation;
-    pthread_t thread;
-    lua_State * L;
-    int callback_ref;
-    bool is_download;
-    char dest_path[PATH_MAX];
-    bool verify_tls;
-
-    char url[2048];
-    http_method_t method;
-    http_header_t headers[HTTP_MAX_HEADERS];
-    int header_count;
-    uint8_t * request_body;
-    size_t request_body_size;
-    char content_type[128];
-    size_t max_response_size;
-    uint32_t connect_timeout_ms;
-    uint32_t read_timeout_ms;
-    uint32_t total_timeout_ms;
-    int redirect_limit;
-
-    bool ok;
-    int status;
-    uint8_t * response_body;
-    size_t response_body_size;
-    http_header_t response_headers[HTTP_MAX_HEADERS];
-    int response_header_count;
-    const char * response_error;
-} plugin_async_http_t;
-
-static plugin_async_http_t plugin_async_http[PLUGIN_MAX_ASYNC_HTTP];
-
-static bool plugin_async_download_progress(uint64_t downloaded, uint64_t total, void * user_data) {
-    (void) downloaded;
-    (void) total;
-    plugin_async_http_t * req = (plugin_async_http_t *) user_data;
-    return !http_cancel_token_is_cancelled(&req->cancel);
-}
-
-static void plugin_dedupe_headers_case_insensitive(http_header_t * headers, int * count) {
-    int out = 0;
-    for (int i = 0; i < *count; i++) {
-        bool superseded = false;
-        for (int j = i + 1; j < *count; j++) {
-            if (strcasecmp(headers[i].name, headers[j].name) == 0) { superseded = true; break; }
-        }
-        if (superseded) continue;
-        if (out != i) headers[out] = headers[i];
-        out++;
-    }
-    *count = out;
-}
-
-static void * plugin_async_http_thread_func(void * arg) {
-    plugin_async_http_t * req = (plugin_async_http_t *) arg;
-    if (req->is_download) {
-        char temp_path[PATH_MAX];
-        int n;
-        if (plugin_storage_path_is_reserved(req->dest_path)) {
-            n = -1;
-        } else {
-            n = snprintf(temp_path, sizeof(temp_path), "%s.part.XXXXXX", req->dest_path);
-        }
-        if (n <= 0 || (size_t) n >= sizeof(temp_path)) {
-            req->ok = false;
-        } else {
-            int fd = mkstemp(temp_path);
-            if (fd < 0) {
-                req->ok = false;
-            } else {
-                close(fd);
-                req->ok = http_get_to_file_bounded(req->url, req->verify_tls, temp_path, 0,
-                                                    plugin_async_download_progress, req);
-                bool cancelled = http_cancel_token_is_cancelled(&req->cancel);
-                if (req->ok && !cancelled) {
-                    req->ok = rename(temp_path, req->dest_path) == 0;
+            mp3_index_job_t * completed_index = mp3_index_result;
+            mp3_index_result = NULL;
+            if (completed_index && completed_index->generation == cur_generation &&
+                cur_dec.type == DECODER_MP3) {
+                bool adopted = completed_index->outcome == MP3_INDEX_READY &&
+                    drmp3_bind_seek_table(cur_dec.as.mp3, completed_index->count,
+                                          completed_index->points);
+                if (adopted) {
+                    cur_dec.mp3_seek_points = completed_index->points;
+                    cur_dec.mp3_seek_point_count = completed_index->count;
+                    completed_index->points = NULL;
+                    cur_dec.mp3_seek_index_attempted = true;
+                    if (mp3_seek_deferred &&
+                        mp3_seek_deferred_generation == cur_generation) {
+                        do_seek = true;
+                        seek_frame = mp3_seek_deferred_frame;
+                    }
+                } else {
+                    cur_dec.mp3_seek_index_attempted =
+                        completed_index->outcome != MP3_INDEX_TRANSIENT_FAILURE;
+                    if (mp3_seek_deferred_generation == cur_generation) {
+                        if (completed_index->outcome == MP3_INDEX_TRANSIENT_FAILURE &&
+                            ++mp3_seek_retry_count < MP3_SEEK_RETRY_MAX) {
+                            mp3_seek_retry_after_ms = monotonic_ms() + MP3_SEEK_RETRY_DELAY_MS;
+                        } else {
+                            finish_mp3_deferred_seek_locked();
+                        }
+                    }
                 }
-                if (!req->ok || cancelled) remove(temp_path);
             }
-        }
-    } else {
-        http_request_t hreq;
-        memset(&hreq, 0, sizeof(hreq));
-        snprintf(hreq.url, sizeof(hreq.url), "%s", req->url);
-        hreq.method = req->method;
-        memcpy(hreq.headers, req->headers, sizeof(hreq.headers));
-        hreq.header_count = req->header_count;
-        bool method_has_body = req->method == HTTP_METHOD_POST || req->method == HTTP_METHOD_PUT ||
-                                req->method == HTTP_METHOD_PATCH;
-        hreq.body = method_has_body ? req->request_body : NULL;
-        hreq.body_len = method_has_body ? req->request_body_size : 0;
-        hreq.content_type = (method_has_body && req->content_type[0]) ? req->content_type : NULL;
-        hreq.verify_tls = req->verify_tls;
-        hreq.connect_timeout_ms = req->connect_timeout_ms;
-        hreq.read_timeout_ms = req->read_timeout_ms;
-        hreq.total_timeout_ms = req->total_timeout_ms;
-        hreq.max_response_bytes = req->max_response_size;
-        hreq.redirect_limit = req->redirect_limit;
 
-        http_response_t hresp;
-        req->ok = http_request_ex(&hreq, &req->cancel, &hresp);
-        req->status = hresp.status;
-        req->response_body = hresp.body;
-        req->response_body_size = hresp.body_len;
-        memcpy(req->response_headers, hresp.headers, sizeof(req->response_headers));
-        req->response_header_count = hresp.header_count;
-        plugin_dedupe_headers_case_insensitive(req->response_headers, &req->response_header_count);
-        req->response_error = hresp.error;
+            if (seek_pending && seek_pending_playback_generation == cur_generation) {
+                do_seek = true;
+                seek_frame = seek_pending_is_percent
+                    ? (uint64_t) ((double) cur_dec.total_frames * (seek_pending_percent / 100.0))
+                    : seek_pending_frame;
+            }
+            if (seek_pending) seek_pending = false;
+
+            if (do_seek && seek_frame > 0 && mp3_needs_seek_index(&cur_dec) &&
+                !cur_dec.mp3_seek_points) {
+                if (!cur_dec.mp3_seek_index_attempted) {
+                    defer_mp3_seek_locked(&cur_dec, cur_generation, seek_frame);
+                    request_mp3_seek_index_locked(&cur_dec, cur_path_local,
+                                                  cur_generation);
+                } else {
+                    DBG_LOG("audio: MP3 seek ignored because its index is unavailable (%s)\n",
+                            safe_path_tail(cur_path_local));
+                }
+                do_seek = false;
+            } else if (!do_seek && mp3_seek_deferred &&
+                       mp3_seek_deferred_generation == cur_generation &&
+                       !mp3_index_worker_active && !cur_dec.mp3_seek_index_attempted &&
+                       mp3_needs_seek_index(&cur_dec)) {
+                request_mp3_seek_index_locked(&cur_dec, cur_path_local, cur_generation);
+            }
+            bool hold_for_mp3_seek = mp3_seek_deferred &&
+                                     mp3_seek_deferred_generation == cur_generation &&
+                                     !do_seek;
+            bool xfade_on = crossfade_enabled;
+            float vol = volume_gain;
+            bool remain_paused = paused;
+            uint64_t chunk_frames = low_power_mode ? LOW_POWER_CHUNK_FRAMES : NORMAL_CHUNK_FRAMES;
+
+            /* Phase 3: Stack-buffered owned snapshot of next track metadata.
+             * Completely eliminates steady-state heap allocations during playback. */
+            next_track_snapshot_t staged_next = {0};
+            if (next_path != NULL) {
+                size_t len = strlen(next_path);
+                if (len < sizeof(staged_next.path)) {
+                    memcpy(staged_next.path, next_path, len + 1);
+                    staged_next.valid = true;
+                    staged_next.replaygain_linear = next_replaygain_linear;
+                    staged_next.replaygain_applied = next_replaygain_applied;
+                    staged_next.generation = next_track_generation;
+                }
+            }
+            const char * staged_next_path = staged_next.valid ? staged_next.path : NULL;
+            float staged_next_replaygain = staged_next.replaygain_linear;
+            bool staged_next_replaygain_applied = staged_next.replaygain_applied;
+            uint64_t staged_next_generation = staged_next.generation;
+            pthread_mutex_unlock(&audio_mutex);
+            free_mp3_index_job(completed_index);
+
+#ifndef HOST_BUILD
+            /* Real-device bug: connecting Bluetooth headphones mid-track (the
+             * common case -- a user pairs while a track is already playing,
+             * or this app auto-resumed playback before the GUI's connection
+             * poll had even run once) never switched output, because the two
+             * ensure_device() call sites below only run at a track boundary
+             * (a fresh audio_play_file_at(), or the automatic handoff into a
+             * queued next track). The requested Bluetooth target can change
+             * at any moment from the GUI thread's poll, so it needs checking
+             * every chunk here too, not just at those boundaries. Cheap:
+             * audio_output_ensure() (which this delegates to) already only
+             * reopens if the format OR the Bluetooth target actually
+             * changed, so calling it unconditionally every chunk costs
+             * nothing extra when nothing changed. Best-effort -- write_device()
+             * below skips writing rather than crashing if this fails, and the
+             * next iteration tries again. */
+            if (!hold_for_mp3_seek)
+                ensure_device(cur_dec.channels, cur_dec.sample_rate);
+#endif
+
+            if (do_restart || do_stop) {
+                /* Phase 4: Controlled transition ramp-down on manual stop/restart */
+                if (!mp3_seek_output_held && cur_open && cur_dec.sample_rate > 0) {
+                    uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+                    decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
+                    if (r_fade.frames > 0) {
+                        apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, cur_replaygain_linear);
+                        peq_process(buf_cur, (size_t) r_fade.frames, (int) cur_dec.channels, cur_dec.sample_rate);
+                        apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, vol);
+                        apply_ramp(buf_cur, r_fade.frames, cur_dec.channels, 1.0f, 0.0f);
+#ifndef HOST_BUILD
+                        uint64_t delivered = 0;
+                        write_device_transition_ramp(buf_cur, r_fade.frames, cur_dec.channels,
+                                                     cur_dec.sample_rate, cur_path_local, &delivered);
+#else
+                        write_device(buf_cur, r_fade.frames, cur_dec.channels);
+#endif
+                    }
+                }
+                if (do_restart) should_restart = true;
+                if (do_stop) was_stopped = true;
+                break;
+            }
+
+            if (hold_for_mp3_seek) {
+                if (!mp3_seek_output_held) {
+                    close_decoder_if_open(&nxt_dec, &nxt_open);
+                    nxt_format_matches = false;
+#ifndef HOST_BUILD
+                    close_device();
+#endif
+                    mp3_seek_output_held = true;
+                    need_fade_in = true;
+                }
+                /* Worker completion and transport commands signal audio_cond.
+                 * The timeout only services a delayed transient retry. */
+                struct timespec wake;
+                clock_gettime(CLOCK_REALTIME, &wake);
+                wake.tv_nsec += 100000000L;
+                if (wake.tv_nsec >= 1000000000L) {
+                    wake.tv_sec++;
+                    wake.tv_nsec -= 1000000000L;
+                }
+                pthread_mutex_lock(&audio_mutex);
+                if (mp3_seek_deferred &&
+                    mp3_seek_deferred_generation == cur_generation &&
+                    !stop_requested && !restart_requested && !seek_pending &&
+                    !mp3_index_result)
+                    pthread_cond_timedwait(&audio_cond, &audio_mutex, &wake);
+                pthread_mutex_unlock(&audio_mutex);
+                continue;
+            }
+
+            /* A permanent failure or exhausted transient retry resumes from
+             * the confirmed decoder cursor, with the same fade-in used after
+             * a successful seek. */
+            if (remain_paused && !do_seek)
+                continue;
+            if (mp3_seek_output_held && !do_seek)
+                mp3_seek_output_held = false;
+
+            if (do_seek) {
+                /* Network decoders are forward-only. Keep this guard at the
+                 * owner thread as well as the public API: a seek may be
+                 * queued while a newly requested stream is still opening,
+                 * before current_format_info identifies it as a stream. */
+                if (cur_dec.net_stream) {
+                    DBG_LOG("audio: ignoring seek on network stream (%s)\n",
+                            safe_path_tail(cur_path_local));
+                    continue;
+                }
+
+                /* Smooth seek on the playback-owned decoder. Long MP3s reach
+                 * this point only after their bounded table is ready. */
+                if (!mp3_seek_output_held && cur_open && cur_dec.sample_rate > 0) {
+                    uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+                    decoder_read_result_t r_fade = decoder_read_s16(&cur_dec, rf, buf_cur);
+                    if (r_fade.frames > 0) {
+                        apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, cur_replaygain_linear);
+                        peq_process(buf_cur, (size_t) r_fade.frames, (int) cur_dec.channels, cur_dec.sample_rate);
+                        apply_gain(buf_cur, (size_t) r_fade.frames * cur_dec.channels, vol);
+                        apply_ramp(buf_cur, r_fade.frames, cur_dec.channels, 1.0f, 0.0f);
+#ifndef HOST_BUILD
+                        uint64_t delivered = 0;
+                        write_device_transition_ramp(buf_cur, r_fade.frames, cur_dec.channels,
+                                                     cur_dec.sample_rate, cur_path_local, &delivered);
+#else
+                        write_device(buf_cur, r_fade.frames, cur_dec.channels);
+#endif
+                    }
+                }
+
+                close_decoder_if_open(&nxt_dec, &nxt_open);
+                nxt_format_matches = false;
+                if (seek_frame > cur_dec.total_frames) seek_frame = cur_dec.total_frames;
+                if (decoder_seek(&cur_dec, seek_frame)) {
+                    cur_frames_played_local = seek_frame;
+                    pthread_mutex_lock(&audio_mutex);
+                    frames_played = cur_frames_played_local;
+                    if (mp3_seek_deferred_generation == cur_generation)
+                        finish_mp3_deferred_seek_locked();
+                    pthread_mutex_unlock(&audio_mutex);
+                    mp3_seek_output_held = remain_paused;
+                    need_fade_in = true;
+                    consecutive_decoder_errors = 0;
+                } else {
+                    DBG_LOG("audio: seek to frame %" PRIu64 " failed (%s)\n",
+                            seek_frame, safe_path_tail(cur_path_local));
+                    pthread_mutex_lock(&audio_mutex);
+                    if (mp3_seek_deferred_generation == cur_generation)
+                        finish_mp3_deferred_seek_locked();
+                    pthread_mutex_unlock(&audio_mutex);
+                    /* Some codecs reset internal state before they can know
+                     * the seek will fail (AAC closes/recreates its handle,
+                     * Opus moves the demux cursor before discarding). Restore
+                     * the last confirmed position sequentially so playback
+                     * never continues through a half-mutated decoder. */
+                    if (!reopen_decoder_at(&cur_dec, cur_path_local,
+                                           cur_frames_played_local)) {
+                        cur_open = false;
+                        pthread_mutex_lock(&audio_mutex);
+                        last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                        last_playback_error_generation = cur_generation;
+                        have_current = false;
+                        clear_current_format_locked();
+                        paused = false;
+                        pthread_mutex_unlock(&audio_mutex);
+                        should_restart = false;
+                        was_stopped = false;
+                        ended_with_no_next = false;
+                        goto inner_loop_done;
+                    }
+                    cur_open = true;
+                    mp3_seek_output_held = remain_paused;
+                    need_fade_in = true;
+                    consecutive_decoder_errors = 0;
+                }
+                continue; /* re-check pause/restart state before decoding */
+            }
+
+            uint64_t frames_remaining = (cur_dec.total_frames > cur_frames_played_local)
+                ? cur_dec.total_frames - cur_frames_played_local : 0;
+            uint64_t crossfade_frames = (uint64_t) (CROSSFADE_SECONDS * (double) cur_dec.sample_rate);
+            bool in_blend_window = xfade_on && staged_next_path != NULL &&
+                                   frames_remaining > 0 && frames_remaining <= crossfade_frames;
+
+            if (in_blend_window && !nxt_open) {
+                if (decoder_open(&nxt_dec, staged_next_path)) {
+                    nxt_open = true;
+                    nxt_frames_consumed = 0;
+                    nxt_replaygain_linear_local = staged_next_replaygain;
+                    nxt_replaygain_applied_local = staged_next_replaygain_applied;
+                    nxt_format_matches = (nxt_dec.channels == cur_dec.channels && nxt_dec.sample_rate == cur_dec.sample_rate);
+                } else {
+                    DBG_LOG("audio: failed to prefetch next track (%s)\n",
+                            safe_path_tail(staged_next_path));
+                }
+            }
+
+            if (in_blend_window && nxt_open && nxt_format_matches) {
+                unsigned int channels = cur_dec.channels;
+                uint64_t want = (frames_remaining < chunk_frames) ? frames_remaining : chunk_frames;
+                decoder_read_result_t r_cur = decoder_read_s16(&cur_dec, want, buf_cur);
+                uint64_t n_cur = r_cur.frames;
+
+                if (r_cur.status == DECODER_READ_FATAL_ERROR) {
+                    DBG_LOG("audio: crossfade fatal decode error (%s)\n", safe_path_tail(cur_path_local));
+                    close_decoder_if_open(&nxt_dec, &nxt_open);
+                    nxt_format_matches = false;
+                    pthread_mutex_lock(&audio_mutex);
+                    last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                    last_playback_error_generation = cur_generation;
+                    have_current = false;
+                    clear_current_format_locked();
+                    paused = false;
+                    pthread_mutex_unlock(&audio_mutex);
+                    should_restart = false;
+                    was_stopped = false;
+                    ended_with_no_next = false;
+                    goto inner_loop_done;
+                }
+
+                if (n_cur == 0 && frames_remaining > 0 && r_cur.status == DECODER_READ_EOF) {
+                    bool is_stream = (cur_dec.net_stream != NULL);
+                    if (is_premature_eof(cur_frames_played_local, cur_dec.total_frames, is_stream)) {
+                        bool recovered = false;
+                        for (int dr = 0; dr < 3; dr++) {
+                            pthread_mutex_lock(&audio_mutex);
+                            bool abort = stop_requested || restart_requested;
+                            pthread_mutex_unlock(&audio_mutex);
+                            if (abort) break;
+
+                            DBG_LOG("audio: crossfade premature EOF at frame %" PRIu64 "/%" PRIu64
+                                    ", reopen attempt %d (%s)\n",
+                                    cur_frames_played_local, cur_dec.total_frames, dr + 1,
+                                    safe_path_tail(cur_path_local));
+                            usleep(50000);
+
+                            if (!reopen_decoder_at(&cur_dec, cur_path_local, cur_frames_played_local)) {
+                                DBG_LOG("audio: crossfade decoder reopen failed on attempt %d\n", dr + 1);
+                                cur_open = false;
+                                continue;
+                            }
+                            cur_open = true;
+                            r_cur = decoder_read_s16(&cur_dec, want, buf_cur);
+                            n_cur = r_cur.frames;
+                            if (n_cur > 0) { recovered = true; break; }
+                        }
+                        if (!recovered) {
+                            DBG_LOG("audio: crossfade decoder recovery exhausted (%s)\n",
+                                    safe_path_tail(cur_path_local));
+                            close_decoder_if_open(&nxt_dec, &nxt_open);
+                            nxt_format_matches = false;
+                            pthread_mutex_lock(&audio_mutex);
+                            last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                            last_playback_error_generation = cur_generation;
+                            have_current = false;
+                            clear_current_format_locked();
+                            paused = false;
+                            pthread_mutex_unlock(&audio_mutex);
+                            should_restart = false;
+                            was_stopped = false;
+                            ended_with_no_next = false;
+                            goto inner_loop_done;
+                        }
+                    }
+                }
+
+                if (n_cur > 0) {
+                    decoder_read_result_t r_next = decoder_read_s16(&nxt_dec, n_cur, buf_next);
+                    bool nxt_failed = false;
+
+                    if (r_next.status == DECODER_READ_FATAL_ERROR || (r_next.status == DECODER_READ_EOF && r_next.frames == 0)) {
+                        nxt_failed = true;
+                    } else if (r_next.status == DECODER_READ_RECOVERABLE_ERROR) {
+                        consecutive_nxt_decoder_errors++;
+                        DBG_LOG("audio: next track recoverable decode error (%u/10) (%s)\n",
+                                consecutive_nxt_decoder_errors, safe_path_tail(staged_next_path));
+                        if (consecutive_nxt_decoder_errors >= 10) {
+                            DBG_LOG("audio: next track consecutive recoverable errors exceeded limit, cancelling blend (%s)\n",
+                                    safe_path_tail(staged_next_path));
+                            nxt_failed = true;
+                        }
+                    } else if (r_next.status == DECODER_READ_OK) {
+                        consecutive_nxt_decoder_errors = 0;
+                    }
+
+                    if (nxt_failed) {
+                        DBG_LOG("audio: next track crossfade decode failed (status=%d), cancelling crossfade (%s)\n",
+                                (int) r_next.status, safe_path_tail(staged_next_path));
+                        close_decoder_if_open(&nxt_dec, &nxt_open);
+                        nxt_format_matches = false;
+                        consecutive_nxt_decoder_errors = 0;
+
+                        /* IMPORTANT: Do NOT discard buf_cur! Output the decoded frames of cur_dec
+                         * as unblended audio and advance cur_frames_played_local to prevent skips
+                         * and maintain accurate timeline sync. */
+                        apply_gain(buf_cur, (size_t) n_cur * channels, cur_replaygain_linear);
+                        peq_process(buf_cur, (size_t) n_cur, (int) channels, cur_dec.sample_rate);
+                        apply_gain(buf_cur, (size_t) n_cur * channels, vol);
+
+                        if (need_fade_in) {
+                            uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+                            uint64_t in_frames = (n_cur < rf) ? n_cur : rf;
+                            apply_ramp(buf_cur, in_frames, channels, 0.0f, 1.0f);
+                            need_fade_in = false;
+                        }
+
+#ifndef HOST_BUILD
+                        uint64_t delivered = 0;
+                        write_result_t wr = write_device_with_retry(buf_cur, n_cur, channels,
+                                                                     cur_dec.sample_rate, cur_path_local,
+                                                                     &delivered);
+                        cur_frames_played_local += delivered;
+                        frames_remaining -= (delivered < frames_remaining) ? delivered : frames_remaining;
+                        pthread_mutex_lock(&audio_mutex);
+                        frames_played = cur_frames_played_local;
+                        pthread_mutex_unlock(&audio_mutex);
+
+                        if (wr == WRITE_RESULT_ABORTED) {
+                            continue;
+                        } else if (wr == WRITE_RESULT_FAILED) {
+                            DBG_LOG("audio: crossfade fallback output failure (%s)\n", safe_path_tail(cur_path_local));
+                            pthread_mutex_lock(&audio_mutex);
+                            last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                            last_playback_error_generation = cur_generation;
+                            have_current = false;
+                            clear_current_format_locked();
+                            paused = false;
+                            pthread_mutex_unlock(&audio_mutex);
+                            should_restart = false;
+                            was_stopped = false;
+                            ended_with_no_next = false;
+                            goto inner_loop_done;
+                        }
+#else
+                        write_device(buf_cur, n_cur, channels);
+                        cur_frames_played_local += n_cur;
+                        frames_remaining -= (n_cur < frames_remaining) ? n_cur : frames_remaining;
+                        pthread_mutex_lock(&audio_mutex);
+                        frames_played = cur_frames_played_local;
+                        pthread_mutex_unlock(&audio_mutex);
+#endif
+                        continue;
+                    }
+
+                    uint64_t n_next = r_next.frames;
+                    nxt_frames_consumed += n_next;
+                    if (n_next < n_cur) {
+                        memset(buf_next + (size_t) n_next * channels, 0, (size_t) (n_cur - n_next) * channels * sizeof(int16_t));
+                    }
+
+                    apply_gain(buf_cur, (size_t) n_cur * channels, cur_replaygain_linear);
+                    apply_gain(buf_next, (size_t) n_cur * channels, nxt_replaygain_linear_local);
+
+                    uint64_t fade_start_frame = crossfade_frames - frames_remaining;
+                    mix_crossfade(buf_cur, buf_next, buf_out, n_cur, channels, fade_start_frame, crossfade_frames);
+
+                    peq_process(buf_out, (size_t) n_cur, (int) channels, cur_dec.sample_rate);
+                    apply_gain(buf_out, (size_t) n_cur * channels, vol);
+
+                    if (need_fade_in) {
+                        uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+                        uint64_t in_frames = (n_cur < rf) ? n_cur : rf;
+                        apply_ramp(buf_out, in_frames, channels, 0.0f, 1.0f);
+                        need_fade_in = false;
+                    }
+
+#ifndef HOST_BUILD
+                    uint64_t delivered = 0;
+                    write_result_t wr = write_device_with_retry(buf_out, n_cur, channels,
+                                                                 cur_dec.sample_rate, cur_path_local,
+                                                                 &delivered);
+                    cur_frames_played_local += delivered;
+                    frames_remaining -= (delivered < frames_remaining) ? delivered : frames_remaining;
+                    pthread_mutex_lock(&audio_mutex);
+                    frames_played = cur_frames_played_local;
+                    pthread_mutex_unlock(&audio_mutex);
+
+                    if (wr == WRITE_RESULT_ABORTED) {
+                        continue;
+                    } else if (wr == WRITE_RESULT_FAILED) {
+                        DBG_LOG("audio: crossfade output failure, abandoning blend (%s)\n",
+                                safe_path_tail(cur_path_local));
+                        close_decoder_if_open(&nxt_dec, &nxt_open);
+                        nxt_format_matches = false;
+                        pthread_mutex_lock(&audio_mutex);
+                        last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                        last_playback_error_generation = cur_generation;
+                        have_current = false;
+                        clear_current_format_locked();
+                        paused = false;
+                        pthread_mutex_unlock(&audio_mutex);
+                        should_restart = false;
+                        was_stopped = false;
+                        ended_with_no_next = false;
+                        goto inner_loop_done;
+                    }
+#else
+                    write_device(buf_out, n_cur, channels);
+                    cur_frames_played_local += n_cur;
+                    frames_remaining -= n_cur;
+                    pthread_mutex_lock(&audio_mutex);
+                    frames_played = cur_frames_played_local;
+                    pthread_mutex_unlock(&audio_mutex);
+#endif
+
+                    if (frames_remaining > 0) {
+                        continue; /* more of cur left in the window, keep blending */
+                    }
+                }
+
+                /* Blend window finished (cur fully consumed) -- promote next to current.
+                 * Verify the snapshot's generation still matches what was armed --
+                 * if not, another audio_set_next_track() replaced the queued track
+                 * while we were in the crossfade window; discard the stale prefetch. */
+                pthread_mutex_lock(&audio_mutex);
+                bool snap_still_valid = (staged_next_generation == next_track_generation);
+                if (snap_still_valid) {
+                    decoder_close(&cur_dec);
+                    cur_dec = nxt_dec;
+                    nxt_open = false;
+                    nxt_format_matches = false;
+                    cur_frames_played_local = nxt_frames_consumed;
+                    cur_replaygain_linear = nxt_replaygain_linear_local;
+                    cur_replaygain_applied = nxt_replaygain_applied_local;
+                    free(cur_path_local);
+                    cur_path_local = next_path; next_path = NULL;
+                    free(active_path);
+                    active_path = cur_path_local ? strdup(cur_path_local) : NULL;
+                    playback_generation++;
+                    seek_pending = false;
+                    cur_generation = playback_generation;
+                    current_total_frames = cur_dec.total_frames;
+                    current_sample_rate = cur_dec.sample_rate;
+                    frames_played = cur_frames_played_local;
+                    publish_current_format_locked(&cur_dec, cur_path_local,
+                                                  cur_replaygain_linear, cur_replaygain_applied);
+                    track_advanced = true;
+                    pthread_mutex_unlock(&audio_mutex);
+                } else {
+                    /* Stale prefetch: a newer next track was armed -- close
+                     * nxt_dec and let the current track continue to its own EOF. */
+                    pthread_mutex_unlock(&audio_mutex);
+                    close_decoder_if_open(&nxt_dec, &nxt_open);
+                    nxt_format_matches = false;
+                    DBG_LOG("audio: stale crossfade prefetch discarded (%s)\n",
+                            safe_path_tail(staged_next_path));
+                }
+                continue;
+            }
+
+            /* Not blending (crossfade off, not yet near the end, or the next
+             * track's format doesn't match) -- plain single-source playback. */
+            {
+            decoder_read_result_t r_cur = decoder_read_s16(&cur_dec, chunk_frames, buf_cur);
+            uint64_t n_cur = r_cur.frames;
+
+            if (r_cur.status == DECODER_READ_RECOVERABLE_ERROR) {
+                consecutive_decoder_errors++;
+                DBG_LOG("audio: recoverable decoder error #%u at frame %" PRIu64 " (%s)\n",
+                        consecutive_decoder_errors, cur_frames_played_local, safe_path_tail(cur_path_local));
+                if (consecutive_decoder_errors >= 10) {
+                    DBG_LOG("audio: consecutive recoverable errors exceeded limit (%s)\n",
+                            safe_path_tail(cur_path_local));
+                    r_cur.status = DECODER_READ_FATAL_ERROR;
+                }
+            } else if (r_cur.status == DECODER_READ_OK) {
+                consecutive_decoder_errors = 0;
+            }
+
+            if (r_cur.status == DECODER_READ_FATAL_ERROR) {
+                DBG_LOG("audio: fatal decoder error at frame %" PRIu64 "/%" PRIu64 " (%s)\n",
+                        cur_frames_played_local, cur_dec.total_frames, safe_path_tail(cur_path_local));
+                pthread_mutex_lock(&audio_mutex);
+                last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                last_playback_error_generation = cur_generation;
+                have_current = false;
+                clear_current_format_locked();
+                paused = false;
+                pthread_mutex_unlock(&audio_mutex);
+                should_restart = false;
+                was_stopped = false;
+                ended_with_no_next = false;
+                goto inner_loop_done;
+            }
+
+            if (n_cur == 0 && r_cur.status == DECODER_READ_EOF) {
+                /* Zero-frame read: check whether this is a premature EOF for a
+                 * finite local file, or a genuine (or live-stream) end. */
+                bool is_stream = (cur_dec.net_stream != NULL);
+                if (is_premature_eof(cur_frames_played_local, cur_dec.total_frames, is_stream)) {
+                    /* Attempt bounded reopen+seek recovery */
+                    bool recovered = false;
+                    for (int dr = 0; dr < 3; dr++) {
+                        pthread_mutex_lock(&audio_mutex);
+                        bool abort = stop_requested || restart_requested;
+                        pthread_mutex_unlock(&audio_mutex);
+                        if (abort) break;
+
+                        DBG_LOG("audio: premature EOF at frame %" PRIu64 "/%" PRIu64
+                                ", reopen attempt %d (%s)\n",
+                                cur_frames_played_local, cur_dec.total_frames, dr + 1,
+                                safe_path_tail(cur_path_local));
+                        usleep(50000); /* 50 ms backoff */
+
+                        if (!reopen_decoder_at(&cur_dec, cur_path_local,
+                                               cur_frames_played_local)) {
+                            DBG_LOG("audio: decoder reopen failed on attempt %d\n", dr + 1);
+                            cur_open = false; /* dec is now closed */
+                            continue;
+                        }
+                        cur_open = true;
+                        r_cur = decoder_read_s16(&cur_dec, chunk_frames, buf_cur);
+                        n_cur = r_cur.frames;
+                        if (n_cur > 0) { recovered = true; break; }
+                    }
+                    if (!recovered) {
+                        DBG_LOG("audio: decoder recovery exhausted at %" PRIu64 "/%" PRIu64
+                                " (%s)\n",
+                                cur_frames_played_local, cur_dec.total_frames,
+                                safe_path_tail(cur_path_local));
+                        pthread_mutex_lock(&audio_mutex);
+                        last_playback_error = AUDIO_ERROR_DECODER_FAILED;
+                        last_playback_error_generation = cur_generation;
+                        have_current = false;
+                        clear_current_format_locked();
+                        paused = false;
+                        pthread_mutex_unlock(&audio_mutex);
+                        should_restart = false;
+                        was_stopped = false;
+                        ended_with_no_next = false;
+                        goto inner_loop_done;
+                    }
+                    /* n_cur > 0 now -- fall through to normal processing */
+                }
+
+                if (n_cur == 0) {
+                    /* True EOF (or live stream end). If a next track is queued, hand
+                     * off to it -- seamlessly if the format matches (device stays open),
+                     * or with a brief reopen if it doesn't. */
+                    if (!nxt_open && staged_next_path != NULL) {
+                        if (decoder_open(&nxt_dec, staged_next_path)) {
+                            nxt_open = true;
+                            nxt_frames_consumed = 0;
+                            nxt_replaygain_linear_local = staged_next_replaygain;
+                            nxt_replaygain_applied_local = staged_next_replaygain_applied;
+                        } else {
+                            DBG_LOG("audio: failed to open next track (%s)\n",
+                                    safe_path_tail(staged_next_path));
+                        }
+                    }
+
+                    if (nxt_open) {
+                        pthread_mutex_lock(&audio_mutex);
+                        bool snap_still_valid = (staged_next_generation == next_track_generation);
+                        if (!snap_still_valid) {
+                            /* Stale next track: queued track was replaced while playing. Discard nxt_dec. */
+                            pthread_mutex_unlock(&audio_mutex);
+                            close_decoder_if_open(&nxt_dec, &nxt_open);
+                            nxt_format_matches = false;
+                            DBG_LOG("audio: stale gapless prefetch discarded (%s)\n",
+                                    safe_path_tail(staged_next_path));
+                            ended_with_no_next = true;
+                            break;
+                        }
+                        pthread_mutex_unlock(&audio_mutex);
+
+                        bool device_ok = ensure_device(nxt_dec.channels, nxt_dec.sample_rate);
+                        decoder_close(&cur_dec);
+                        cur_dec = nxt_dec;
+                        cur_open = true;
+                        nxt_open = false;
+                        cur_frames_played_local = nxt_frames_consumed;
+                        cur_replaygain_linear = nxt_replaygain_linear_local;
+                        cur_replaygain_applied = nxt_replaygain_applied_local;
+                        free(cur_path_local);
+
+                        pthread_mutex_lock(&audio_mutex);
+                        cur_path_local = next_path; next_path = NULL;
+                        free(active_path);
+                        active_path = cur_path_local ? strdup(cur_path_local) : NULL;
+                        playback_generation++;
+                        seek_pending = false;
+                        cur_generation = playback_generation;
+                        current_total_frames = cur_dec.total_frames;
+                        current_sample_rate = cur_dec.sample_rate;
+                        frames_played = cur_frames_played_local;
+                        publish_current_format_locked(&cur_dec, cur_path_local,
+                                                      cur_replaygain_linear, cur_replaygain_applied);
+                        track_advanced = true;
+                        pthread_mutex_unlock(&audio_mutex);
+
+                        if (!device_ok) { ended_with_no_next = true; break; }
+                        continue;
+                    }
+
+                    ended_with_no_next = true;
+                    break;
+                }
+            }
+
+            apply_gain(buf_cur, (size_t) n_cur * cur_dec.channels, cur_replaygain_linear);
+            peq_process(buf_cur, (size_t) n_cur, (int) cur_dec.channels, cur_dec.sample_rate);
+            apply_gain(buf_cur, (size_t) n_cur * cur_dec.channels, vol);
+
+            if (need_fade_in && n_cur > 0) {
+                uint64_t rf = calculate_ramp_frames(cur_dec.sample_rate);
+                uint64_t in_frames = (n_cur < rf) ? n_cur : rf;
+                apply_ramp(buf_cur, in_frames, cur_dec.channels, 0.0f, 1.0f);
+                need_fade_in = false;
+            }
+
+#ifndef HOST_BUILD
+            uint64_t delivered = 0;
+            write_result_t wr = write_device_with_retry(buf_cur, n_cur, cur_dec.channels,
+                                                         cur_dec.sample_rate, cur_path_local,
+                                                         &delivered);
+            cur_frames_played_local += delivered;
+            pthread_mutex_lock(&audio_mutex);
+            frames_played = cur_frames_played_local;
+            pthread_mutex_unlock(&audio_mutex);
+
+            if (wr == WRITE_RESULT_ABORTED) {
+                continue;
+            } else if (wr == WRITE_RESULT_FAILED) {
+                DBG_LOG("audio: output failure, stopping (%s)\n",
+                        safe_path_tail(cur_path_local));
+                pthread_mutex_lock(&audio_mutex);
+                last_playback_error = AUDIO_ERROR_OUTPUT_FAILED;
+                last_playback_error_generation = cur_generation;
+                have_current = false;
+                clear_current_format_locked();
+                paused = false;
+                pthread_mutex_unlock(&audio_mutex);
+                should_restart = false;
+                was_stopped = false;
+                ended_with_no_next = false;
+                goto inner_loop_done;
+            }
+#else
+            write_device(buf_cur, n_cur, cur_dec.channels);
+            cur_frames_played_local += n_cur;
+            pthread_mutex_lock(&audio_mutex);
+            frames_played = cur_frames_played_local;
+            pthread_mutex_unlock(&audio_mutex);
+#endif
+            } /* end plain single-source block */
+
+        }
+        inner_loop_done: /* error-path goto target: skip break-flag handling */
+
+        if (should_restart) continue; /* reopen at the top of the outer loop */
+
+        close_decoder_if_open(&nxt_dec, &nxt_open);
+        if (cur_open) { decoder_close(&cur_dec); cur_open = false; }
+        close_device();
+        free(cur_path_local);
+        cur_path_local = NULL;
+
+        pthread_mutex_lock(&audio_mutex);
+        /* have_current was already cleared in the error gotos above; for
+         * normal break paths (stop, natural EOF) it still needs clearing. */
+        have_current = false;
+        clear_current_format_locked();
+        paused = false;
+        if (ended_with_no_next) track_finished = true;
+        if (was_stopped) stop_requested = false;
+        pthread_mutex_unlock(&audio_mutex);
     }
-    free(req->request_body);
-    req->request_body = NULL;
-    req->request_body_size = 0;
-    atomic_store(&req->done, true);
+
+    free(buf_cur);
+    free(buf_next);
+    free(buf_out);
     return NULL;
 }
 
-static int l_plugin_http_request(lua_State * L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    luaL_checktype(L, 2, LUA_TFUNCTION);
-
-    int slot = -1;
-    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
-        if (!plugin_async_http[i].active) { slot = i; break; }
-    }
-    if (slot < 0) {
-        lua_pushnil(L);
-        lua_pushstring(L, "too many active HTTP requests");
-        return 2;
-    }
-
-    lua_getfield(L, 1, "url");
-    const char * url = luaL_checkstring(L, -1);
-    if (strlen(url) >= sizeof(plugin_async_http[slot].url)) {
-        return luaL_error(L, "plugin.http_request: URL is too long");
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, 1, "method");
-    const char * method_str = luaL_optstring(L, -1, "GET");
-    http_method_t method;
-    if (strcasecmp(method_str, "GET") == 0) method = HTTP_METHOD_GET;
-    else if (strcasecmp(method_str, "POST") == 0) method = HTTP_METHOD_POST;
-    else if (strcasecmp(method_str, "PUT") == 0) method = HTTP_METHOD_PUT;
-    else if (strcasecmp(method_str, "PATCH") == 0) method = HTTP_METHOD_PATCH;
-    else if (strcasecmp(method_str, "DELETE") == 0) method = HTTP_METHOD_DELETE;
-    else if (strcasecmp(method_str, "HEAD") == 0) method = HTTP_METHOD_HEAD;
-    else return luaL_error(L, "plugin.http_request: unknown method '%s'", method_str);
-    lua_pop(L, 1);
-
-    lua_getfield(L, 1, "body");
-    size_t body_size = 0;
-    const char * body = lua_isnil(L, -1) ? NULL : luaL_checklstring(L, -1, &body_size);
-    if (body_size > PLUGIN_ASYNC_HTTP_MAX_REQUEST) {
-        return luaL_error(L, "plugin.http_request: request body exceeds %u bytes", PLUGIN_ASYNC_HTTP_MAX_REQUEST);
-    }
-    uint8_t * body_copy = NULL;
-    if (body_size > 0) {
-        body_copy = malloc(body_size);
-        if (!body_copy) return luaL_error(L, "plugin.http_request: out of memory");
-        memcpy(body_copy, body, body_size);
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, 1, "content_type");
-    const char * content_type = luaL_optstring(L, -1, "application/x-www-form-urlencoded");
-    if (strlen(content_type) >= sizeof(plugin_async_http[slot].content_type)) {
-        free(body_copy);
-        return luaL_error(L, "plugin.http_request: content_type is too long");
-    }
-    lua_pop(L, 1);
-
-    http_header_t headers[HTTP_MAX_HEADERS];
-    int header_count = 0;
-    lua_getfield(L, 1, "headers");
-    if (lua_istable(L, -1)) {
-        lua_pushnil(L);
-        while (header_count < HTTP_MAX_HEADERS && lua_next(L, -2) != 0) {
-            if (lua_type(L, -2) == LUA_TSTRING) {
-                size_t name_len = 0, value_len = 0;
-                const char * name = lua_tolstring(L, -2, &name_len);
-                const char * value = lua_tolstring(L, -1, &value_len);
-                if (name && value) {
-                    if (name_len >= sizeof(headers[header_count].name) || value_len >= sizeof(headers[header_count].value)) {
-                        free(body_copy);
-                        return luaL_error(L, "plugin.http_request: header '%s' name/value exceeds %d/%d bytes",
-                                          name, (int) sizeof(headers[0].name) - 1, (int) sizeof(headers[0].value) - 1);
-                    }
-                    memcpy(headers[header_count].name, name, name_len + 1);
-                    memcpy(headers[header_count].value, value, value_len + 1);
-                    header_count++;
-                }
-            }
-            lua_pop(L, 1);
-        }
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, 1, "verify_tls");
-    bool verify_tls = lua_isnil(L, -1) ? true : lua_toboolean(L, -1);
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "max_response_bytes");
-    lua_Integer requested_max = luaL_optinteger(L, -1, PLUGIN_ASYNC_HTTP_DEFAULT_MAX);
-    lua_pop(L, 1);
-    if (requested_max < 1 || requested_max > PLUGIN_ASYNC_HTTP_MAX_RESPONSE) {
-        free(body_copy);
-        return luaL_error(L, "plugin.http_request: max_response_bytes must be 1..%u",
-                          PLUGIN_ASYNC_HTTP_MAX_RESPONSE);
-    }
-
-    lua_getfield(L, 1, "connect_timeout_ms");
-    lua_Integer connect_timeout_ms = luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "read_timeout_ms");
-    lua_Integer read_timeout_ms = luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "total_timeout_ms");
-    lua_Integer total_timeout_ms = luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "redirect_limit");
-    lua_Integer redirect_limit = luaL_optinteger(L, -1, 0);
-    lua_pop(L, 1);
-    if (connect_timeout_ms < 0 || read_timeout_ms < 0 || total_timeout_ms < 0 || redirect_limit < 0) {
-        free(body_copy);
-        return luaL_error(L, "plugin.http_request: timeout/redirect_limit fields must not be negative");
-    }
-
-#define PLUGIN_HTTP_MAX_TIMEOUT_MS (5 * 60 * 1000)
-#define PLUGIN_HTTP_MAX_REDIRECTS 10
-    if (connect_timeout_ms > PLUGIN_HTTP_MAX_TIMEOUT_MS || read_timeout_ms > PLUGIN_HTTP_MAX_TIMEOUT_MS ||
-        total_timeout_ms > PLUGIN_HTTP_MAX_TIMEOUT_MS) {
-        free(body_copy);
-        return luaL_error(L, "plugin.http_request: connect_timeout_ms/read_timeout_ms/total_timeout_ms must not exceed %d",
-                          PLUGIN_HTTP_MAX_TIMEOUT_MS);
-    }
-    if (redirect_limit > PLUGIN_HTTP_MAX_REDIRECTS) {
-        free(body_copy);
-        return luaL_error(L, "plugin.http_request: redirect_limit must not exceed %d", PLUGIN_HTTP_MAX_REDIRECTS);
-    }
-
-    plugin_async_http_t * req = &plugin_async_http[slot];
-    uint16_t generation = (uint16_t) (req->generation + 1);
-    if (generation == 0) generation = 1;
-    memset(req, 0, sizeof(*req));
-    atomic_init(&req->done, false);
-    http_cancel_token_init(&req->cancel);
-    req->generation = generation;
-    req->active = true;
-    req->L = L;
-    req->method = method;
-    memcpy(req->headers, headers, sizeof(req->headers));
-    req->header_count = header_count;
-    req->verify_tls = verify_tls;
-    req->request_body = body_copy;
-    req->request_body_size = body_size;
-    req->max_response_size = (size_t) requested_max;
-    req->connect_timeout_ms = (uint32_t) connect_timeout_ms;
-    req->read_timeout_ms = (uint32_t) read_timeout_ms;
-    req->total_timeout_ms = (uint32_t) total_timeout_ms;
-    req->redirect_limit = (int) redirect_limit;
-    snprintf(req->url, sizeof(req->url), "%s", url);
-    snprintf(req->content_type, sizeof(req->content_type), "%s", content_type);
-    lua_pushvalue(L, 2);
-    req->callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
-    if (pthread_create(&req->thread, NULL, plugin_async_http_thread_func, req) != 0) {
-        luaL_unref(L, LUA_REGISTRYINDEX, req->callback_ref);
-        free(req->request_body);
-        req->request_body = NULL;
-        req->active = false;
-        http_cancel_token_destroy(&req->cancel);
-        lua_pushnil(L);
-        lua_pushstring(L, "could not start HTTP worker");
-        return 2;
-    }
-
-    int handle = ((int) generation << 8) | (slot + 1);
-    lua_pushinteger(L, handle);
-    return 1;
-}
-
-static int l_plugin_download_file_async(lua_State * L) {
-    const char * url = luaL_checkstring(L, 1);
-    const char * dest_path = luaL_checkstring(L, 2);
-    int callback_index = lua_isfunction(L, 3) ? 3 : 4;
-    bool verify_tls = callback_index == 3 ? true : lua_toboolean(L, 3);
-    luaL_checktype(L, callback_index, LUA_TFUNCTION);
-
-    if (strlen(url) >= sizeof(plugin_async_http[0].url))
-        return luaL_error(L, "plugin.download_file_async: URL is too long");
-    if (dest_path[0] == '\0' || strlen(dest_path) >= sizeof(plugin_async_http[0].dest_path) - 12)
-        return luaL_error(L, "plugin.download_file_async: destination path is invalid or too long");
-    if (plugin_storage_path_is_reserved(dest_path))
-        return luaL_error(L, "plugin.download_file_async: path is reserved for plugin.storage/plugin.secrets");
-
-    int slot = -1;
-    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
-        if (!plugin_async_http[i].active) { slot = i; break; }
-    }
-    if (slot < 0) {
-        lua_pushnil(L);
-        lua_pushstring(L, "too many active HTTP requests");
-        return 2;
-    }
-
-    plugin_async_http_t * req = &plugin_async_http[slot];
-    uint16_t generation = (uint16_t) (req->generation + 1);
-    if (generation == 0) generation = 1;
-    memset(req, 0, sizeof(*req));
-    atomic_init(&req->done, false);
-    http_cancel_token_init(&req->cancel);
-    req->generation = generation;
-    req->active = true;
-    req->L = L;
-    req->is_download = true;
-    req->verify_tls = verify_tls;
-    snprintf(req->url, sizeof(req->url), "%s", url);
-    snprintf(req->dest_path, sizeof(req->dest_path), "%s", dest_path);
-    lua_pushvalue(L, callback_index);
-    req->callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
-    if (pthread_create(&req->thread, NULL, plugin_async_http_thread_func, req) != 0) {
-        luaL_unref(L, LUA_REGISTRYINDEX, req->callback_ref);
-        req->active = false;
-        http_cancel_token_destroy(&req->cancel);
-        lua_pushnil(L);
-        lua_pushstring(L, "could not start HTTP worker");
-        return 2;
-    }
-
-    lua_pushinteger(L, ((int) generation << 8) | (slot + 1));
-    return 1;
-}
-
-static int l_plugin_cancel(lua_State * L) {
-    int handle = (int) luaL_checkinteger(L, 1);
-    int slot = (handle & 0xFF) - 1;
-    uint16_t generation = (uint16_t) ((unsigned int) handle >> 8);
-    bool cancelled = false;
-    if (slot >= 0 && slot < PLUGIN_MAX_ASYNC_HTTP) {
-        plugin_async_http_t * req = &plugin_async_http[slot];
-        if (req->active && req->generation == generation) {
-            http_cancel_token_cancel(&req->cancel);
-            cancelled = true;
-        }
-    }
-    lua_pushboolean(L, cancelled);
-    return 1;
-}
-
-static int l_plugin_md5(lua_State * L) {
-    size_t len = 0;
-    const char * data = luaL_checklstring(L, 1, &len);
-
-    unsigned char digest[16];
-    mbedtls_md5((const unsigned char *) data, len, digest);
-
-    char hex[33];
-    for (int i = 0; i < 16; i++) snprintf(hex + i * 2, 3, "%02x", digest[i]);
-    lua_pushstring(L, hex);
-    return 1;
-}
-
-static lua_State * pending_text_input_L = NULL;
-static int pending_text_input_ref = LUA_NOREF;
-
-static int l_plugin_show_text_input(lua_State * L) {
-    const char * title = luaL_checkstring(L, 1);
-    const char * initial_text = (lua_gettop(L) >= 2 && !lua_isnil(L, 2)) ? luaL_checkstring(L, 2) : NULL;
-    bool is_password = lua_toboolean(L, 3);
-    luaL_checktype(L, 4, LUA_TFUNCTION);
-
-    if (pending_text_input_L && pending_text_input_ref != LUA_NOREF) {
-        lua_pushboolean(L, false);
-        lua_pushstring(L, "text input busy");
-        return 2;
-    }
-    lua_pushvalue(L, 4);
-    pending_text_input_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    pending_text_input_L = L;
-
-    gui_plugin_show_text_input(title, initial_text, is_password);
-    lua_pushboolean(L, true);
-    return 1;
-}
-
-static int l_plugin_get_now_playing(lua_State * L) {
-    char title[128], artist[128], album[128];
-    double duration_seconds = 0.0;
-    if (!gui_plugin_get_now_playing(title, sizeof(title), artist, sizeof(artist), album, sizeof(album),
-                                     &duration_seconds)) {
-        lua_pushnil(L);
-        return 1;
-    }
-
-    lua_pushstring(L, title);
-    lua_pushstring(L, artist);
-    lua_pushstring(L, album);
-    lua_pushnumber(L, duration_seconds);
-    return 4;
-}
-
-static int l_plugin_get_play_mode(lua_State * L) {
-    lua_pushstring(L, gui_plugin_get_play_mode());
-    return 1;
-}
-
-static int l_plugin_get_current_track_path(lua_State * L) {
-    const char * path = gui_plugin_get_current_track_path();
-    if (!path) {
-        lua_pushnil(L);
-        return 1;
-    }
-    lua_pushstring(L, path);
-    return 1;
-}
-
-static int push_string_array_result(lua_State * L, char ** items, int count) {
-    if (!items || count <= 0) {
-        lua_pushnil(L);
-        return 1;
-    }
-    lua_newtable(L);
-    for (int i = 0; i < count; i++) {
-        lua_pushstring(L, items[i]);
-        lua_rawseti(L, -2, i + 1);
-    }
-    gui_plugin_free_string_array(items, count);
-    return 1;
-}
-
-static int l_plugin_get_artist_albums(lua_State * L) {
-    const char * artist = luaL_checkstring(L, 1);
-    int count = 0;
-    char ** albums = gui_plugin_get_artist_albums(artist, &count);
-    return push_string_array_result(L, albums, count);
-}
-
-static int l_plugin_get_album_tracks(lua_State * L) {
-    const char * artist = luaL_checkstring(L, 1);
-    const char * album = luaL_checkstring(L, 2);
-    int count = 0;
-    char ** tracks = gui_plugin_get_album_tracks(artist, album, &count);
-    return push_string_array_result(L, tracks, count);
-}
-
-static int l_plugin_get_next_album_tracks(lua_State * L) {
-    const char * artist = luaL_checkstring(L, 1);
-    const char * current_album = luaL_checkstring(L, 2);
-    int count = 0;
-    char ** tracks = gui_plugin_get_next_album_tracks(artist, current_album, &count);
-    return push_string_array_result(L, tracks, count);
-}
-
-static bool plugin_playlist_name_valid(const char * name) {
-    if (!name || !name[0] || strlen(name) > 200 || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
-    for (const unsigned char * p = (const unsigned char *) name; *p; p++)
-        if (*p < 0x20 || *p == 0x7f || *p == '/' || *p == '\\') return false;
-    return true;
-}
-
-static bool plugin_playlist_path_valid(const char * path) {
-    if (!path || plugin_storage_path_is_reserved(path)) return false;
-    char root_real[PATH_MAX], path_real[PATH_MAX];
-    if (!realpath(PLAYLISTS_DIR, root_real) || !realpath(path, path_real)) return false;
-    size_t root_len = strlen(root_real);
-    if (strncmp(path_real, root_real, root_len) != 0 || path_real[root_len] != '/') return false;
-    const char * base = path_real + root_len + 1;
-    if (!base[0] || strchr(base, '/')) return false;
-    const char * ext = strrchr(base, '.');
-    if (!ext || (strcasecmp(ext, ".m3u") != 0 && strcasecmp(ext, ".m3u8") != 0)) return false;
-    struct stat st;
-    return stat(path_real, &st) == 0 && S_ISREG(st.st_mode);
-}
-
-static bool plugin_song_path_valid(const char * path) {
-    if (!path || plugin_storage_path_is_reserved(path)) return false;
-    char root_real[PATH_MAX], path_real[PATH_MAX];
-    if (!realpath(MUSIC_ROOT_DIR, root_real) || !realpath(path, path_real)) return false;
-    size_t root_len = strlen(root_real);
-    if (strncmp(path_real, root_real, root_len) != 0 || path_real[root_len] != '/') return false;
-    struct stat st;
-    return stat(path_real, &st) == 0 && S_ISREG(st.st_mode);
-}
-
-static int push_plugin_error(lua_State * L, const char * message) {
-    lua_pushnil(L);
-    lua_pushstring(L, message);
-    return 2;
-}
-
-static int l_plugin_playlist_list(lua_State * L) {
-    char ** paths = NULL;
-    int count = 0;
-    if (!playlist_files_scan(PLAYLISTS_DIR, &paths, &count)) {
-        lua_pushnil(L);
-        return 1;
-    }
-    return push_string_array_result(L, paths, count);
-}
-
-static int l_plugin_playlist_read(lua_State * L) {
-    const char * m3u_path = luaL_checkstring(L, 1);
-    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "playlist path must be an existing .m3u file in the SD Playlists folder");
-    char ** paths = NULL;
-    int count = 0;
-    if (!playlist_files_read(m3u_path, &paths, &count)) {
-        lua_pushnil(L);
-        return 1;
-    }
-    return push_string_array_result(L, paths, count);
-}
-
-static int l_plugin_playlist_create(lua_State * L) {
-    const char * name = luaL_checkstring(L, 1);
-    const char * song_path = luaL_checkstring(L, 2);
-
-    if (!plugin_playlist_name_valid(name)) return push_plugin_error(L, "invalid playlist name");
-    if (!plugin_song_path_valid(song_path)) return push_plugin_error(L, "song path must be an existing file on the SD card");
-
-    char created_path[512];
-    if (!playlist_files_create(PLAYLISTS_DIR, name, song_path, created_path, sizeof(created_path))) {
-        return push_plugin_error(L, errno == EEXIST ? "playlist already exists" : "could not create playlist");
-    }
-    metadata_db_playlist_insert_one(created_path);
-    lua_pushstring(L, created_path);
-    return 1;
-}
-
-static int l_plugin_playlist_add(lua_State * L) {
-    const char * m3u_path = luaL_checkstring(L, 1);
-    const char * song_path = luaL_checkstring(L, 2);
-    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "invalid playlist path");
-    if (!plugin_song_path_valid(song_path)) return push_plugin_error(L, "invalid song path");
-    if (!playlist_files_append(m3u_path, song_path)) return push_plugin_error(L, "could not update playlist");
-    lua_pushboolean(L, true);
-    return 1;
-}
-
-static int l_plugin_playlist_remove(lua_State * L) {
-    const char * m3u_path = luaL_checkstring(L, 1);
-    const char * song_path = luaL_checkstring(L, 2);
-    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "invalid playlist path");
-    if (!plugin_song_path_valid(song_path)) return push_plugin_error(L, "invalid song path");
-    if (!playlist_files_remove(m3u_path, song_path)) return push_plugin_error(L, "could not update playlist");
-    lua_pushboolean(L, true);
-    return 1;
-}
-
-static int l_plugin_playlist_delete(lua_State * L) {
-    const char * m3u_path = luaL_checkstring(L, 1);
-    if (!plugin_playlist_path_valid(m3u_path)) return push_plugin_error(L, "invalid playlist path");
-    bool ok = playlist_files_delete(m3u_path);
-    if (ok) metadata_db_playlist_delete_one(m3u_path);
-    lua_pushboolean(L, ok);
-    return 1;
-}
-
-static void push_song_row(lua_State * L, const song_row_t * row) {
-    char display_title[128];
-    metadata_db_song_display_title(row, display_title, sizeof(display_title));
-
-    lua_newtable(L);
-    lua_pushinteger(L, (lua_Integer) row->id); lua_setfield(L, -2, "id");
-    lua_pushstring(L, row->path); lua_setfield(L, -2, "path");
-    lua_pushstring(L, display_title); lua_setfield(L, -2, "title");
-    lua_pushstring(L, row->tags.artist); lua_setfield(L, -2, "artist");
-    lua_pushstring(L, row->tags.album); lua_setfield(L, -2, "album");
-    lua_pushstring(L, row->tags.album_artist); lua_setfield(L, -2, "album_artist");
-}
-
-static void push_group_row(lua_State * L, const group_row_t * row) {
-    lua_newtable(L);
-    lua_pushstring(L, row->name); lua_setfield(L, -2, "name");
-    lua_pushinteger(L, row->song_count); lua_setfield(L, -2, "count");
-    lua_pushinteger(L, (lua_Integer) row->first_song_id); lua_setfield(L, -2, "first_song_id");
-    lua_pushstring(L, row->album_artist); lua_setfield(L, -2, "album_artist");
-}
-
-static int push_song_rows_result(lua_State * L, const song_row_t * rows, int count) {
-    lua_newtable(L);
-    for (int i = 0; i < count; i++) {
-        push_song_row(L, &rows[i]);
-        lua_rawseti(L, -2, i + 1);
-    }
-    return 1;
-}
-
-static int l_plugin_library_song_count(lua_State * L) {
-    lua_pushinteger(L, (lua_Integer) gui_plugin_library_song_count());
-    return 1;
-}
-
-static int l_plugin_library_get_songs(lua_State * L) {
-    int offset = (int) luaL_optinteger(L, 1, 0);
-    int limit = (int) luaL_optinteger(L, 2, GUI_PLUGIN_LIBRARY_MAX_PAGE);
-    const char * query = NULL, * artist = NULL, * album_artist = NULL, * album = NULL;
-    if (lua_istable(L, 3)) {
-        lua_getfield(L, 3, "query"); query = lua_tostring(L, -1);
-        lua_getfield(L, 3, "artist"); artist = lua_tostring(L, -1);
-        lua_getfield(L, 3, "album_artist"); album_artist = lua_tostring(L, -1);
-        lua_getfield(L, 3, "album"); album = lua_tostring(L, -1);
-    }
-
-    song_row_t * rows = malloc(sizeof(song_row_t) * GUI_PLUGIN_LIBRARY_MAX_PAGE);
-    int64_t total = 0;
-    int n = rows ? gui_plugin_library_get_songs(query, artist, album_artist, album, offset, limit, rows, &total) : 0;
-    push_song_rows_result(L, rows, n);
-    free(rows);
-    lua_pushinteger(L, (lua_Integer) total);
-    return 2;
-}
-
-static int l_plugin_library_search(lua_State * L) {
-    const char * query = luaL_checkstring(L, 1);
-    int limit = (int) luaL_optinteger(L, 2, GUI_PLUGIN_LIBRARY_MAX_PAGE);
-
-    song_row_t * rows = malloc(sizeof(song_row_t) * GUI_PLUGIN_LIBRARY_MAX_PAGE);
-    int n = rows ? gui_plugin_library_search(query, limit, rows) : 0;
-    int result = push_song_rows_result(L, rows, n);
-    free(rows);
-    return result;
-}
-
-static int l_plugin_library_get_song(lua_State * L) {
-    int64_t id = (int64_t) luaL_checkinteger(L, 1);
-    song_row_t row;
-    if (!gui_plugin_library_get_song(id, &row)) {
-        lua_pushnil(L);
-        return 1;
-    }
-    push_song_row(L, &row);
-    return 1;
-}
-
-static int l_plugin_library_get_artists(lua_State * L) {
-    int offset = (int) luaL_optinteger(L, 1, 0);
-    int limit = (int) luaL_optinteger(L, 2, GUI_PLUGIN_LIBRARY_MAX_PAGE);
-
-    group_row_t * rows = malloc(sizeof(group_row_t) * GUI_PLUGIN_LIBRARY_MAX_PAGE);
-    int n = rows ? gui_plugin_library_get_artists(offset, limit, rows) : 0;
-    lua_newtable(L);
-    for (int i = 0; i < n; i++) {
-        push_group_row(L, &rows[i]);
-        lua_rawseti(L, -2, i + 1);
-    }
-    free(rows);
-    return 1;
-}
-
-static int l_plugin_library_get_albums(lua_State * L) {
-    int offset = (int) luaL_optinteger(L, 1, 0);
-    int limit = (int) luaL_optinteger(L, 2, GUI_PLUGIN_LIBRARY_MAX_PAGE);
-    const char * artist_filter = luaL_optstring(L, 3, NULL);
-
-    group_row_t * rows = malloc(sizeof(group_row_t) * GUI_PLUGIN_LIBRARY_MAX_PAGE);
-    int n = rows ? gui_plugin_library_get_albums(offset, limit, artist_filter, rows) : 0;
-    lua_newtable(L);
-    for (int i = 0; i < n; i++) {
-        push_group_row(L, &rows[i]);
-        lua_rawseti(L, -2, i + 1);
-    }
-    free(rows);
-    return 1;
-}
-
-static int l_plugin_refresh_library(lua_State * L) {
-    plugin_instance_t * inst = plugin_instance_for_state(L);
-    if (!inst || !inst->defined) return luaL_error(L, "plugin.refresh_library requires plugin.define first");
-    time_t now = time(NULL);
-    if (inst->last_library_refresh > 0 && now >= inst->last_library_refresh && now - inst->last_library_refresh < 60) {
-        lua_pushboolean(L, false); lua_pushliteral(L, "rate_limited"); return 2;
-    }
-    if (!gui_plugin_refresh_library()) {
-        lua_pushboolean(L, false); lua_pushliteral(L, "already_running"); return 2;
-    }
-    inst->last_library_refresh = now;
-    lua_pushboolean(L, true); lua_pushliteral(L, "started"); return 2;
-}
-
-typedef enum {
-    PLUGIN_EVENT_TRACK_STARTED = 0,
-    PLUGIN_EVENT_PAUSED,
-    PLUGIN_EVENT_RESUMED,
-    PLUGIN_EVENT_STOPPED,
-    PLUGIN_EVENT_SCREEN_WOKE,
-    PLUGIN_EVENT_COUNT,
-} plugin_event_t;
-
-typedef struct {
-    lua_State * L;
-    int ref;
-} plugin_event_subscriber_t;
-
-static plugin_event_subscriber_t plugin_event_subscribers[PLUGIN_EVENT_COUNT][PLUGIN_MAX_EVENT_SUBSCRIBERS];
-static int plugin_event_subscriber_count[PLUGIN_EVENT_COUNT];
-
-static int l_plugin_on(lua_State * L) {
-    const char * event = luaL_checkstring(L, 1);
-    luaL_checktype(L, 2, LUA_TFUNCTION);
-
-    plugin_event_t idx;
-    if (strcmp(event, "track_started") == 0) idx = PLUGIN_EVENT_TRACK_STARTED;
-    else if (strcmp(event, "paused") == 0) idx = PLUGIN_EVENT_PAUSED;
-    else if (strcmp(event, "resumed") == 0) idx = PLUGIN_EVENT_RESUMED;
-    else if (strcmp(event, "stopped") == 0) idx = PLUGIN_EVENT_STOPPED;
-    else if (strcmp(event, "screen_woke") == 0) idx = PLUGIN_EVENT_SCREEN_WOKE;
-    else return luaL_error(L, "plugin.on: unknown event '%s' (expected \"track_started\", \"paused\", \"resumed\", \"stopped\", or \"screen_woke\")", event);
-
-    if (plugin_event_subscriber_count[idx] >= PLUGIN_MAX_EVENT_SUBSCRIBERS) {
-        return luaL_error(L, "plugin.on: too many subscribers registered for \"%s\" (max %d)", event,
-                           PLUGIN_MAX_EVENT_SUBSCRIBERS);
-    }
-
-    lua_pushvalue(L, 2);
-    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    plugin_event_subscriber_t * sub = &plugin_event_subscribers[idx][plugin_event_subscriber_count[idx]++];
-    sub->L = L;
-    sub->ref = ref;
-    return 0;
-}
-
-typedef struct {
-    lua_State * L;
-    int ref;
-    bool active;
-} plugin_interval_t;
-
-static plugin_interval_t plugin_intervals[PLUGIN_MAX_INTERVALS];
-
-static int l_plugin_set_interval(lua_State * L) {
-    double seconds = luaL_checknumber(L, 1);
-    luaL_checktype(L, 2, LUA_TFUNCTION);
-
-    int slot = -1;
-    for (int i = 0; i < PLUGIN_MAX_INTERVALS; i++) {
-        if (!plugin_intervals[i].active) { slot = i; break; }
-    }
-    if (slot < 0) {
-        return luaL_error(L, "plugin.set_interval: too many active intervals (max %d)", PLUGIN_MAX_INTERVALS);
-    }
-
-    uint32_t period_ms = (uint32_t) (seconds * 1000.0);
-    if (period_ms < PLUGIN_INTERVAL_MIN_MS) period_ms = PLUGIN_INTERVAL_MIN_MS;
-
-    lua_pushvalue(L, 2);
-    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    plugin_intervals[slot].L = L;
-    plugin_intervals[slot].ref = ref;
-    plugin_intervals[slot].active = true;
-
-    gui_plugin_set_interval(slot, period_ms);
-    lua_pushinteger(L, slot + 1);
-    return 1;
-}
-
-static int l_plugin_clear_interval(lua_State * L) {
-    lua_Integer handle = luaL_checkinteger(L, 1);
-    int slot = (int) handle - 1;
-    if (slot < 0 || slot >= PLUGIN_MAX_INTERVALS || !plugin_intervals[slot].active) return 0;
-
-    luaL_unref(plugin_intervals[slot].L, LUA_REGISTRYINDEX, plugin_intervals[slot].ref);
-    plugin_intervals[slot].active = false;
-    plugin_intervals[slot].L = NULL;
-    gui_plugin_clear_interval(slot);
-    return 0;
-}
-
-static bool plugin_id_is_valid(const char * id) {
-    if (!id || !id[0]) return false;
-    for (const unsigned char * p = (const unsigned char *) id; *p; p++) {
-        if (!( (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-               (*p >= '0' && *p <= '9') || *p == '.' || *p == '_' || *p == '-')) return false;
-    }
-    return true;
-}
-
-static bool plugin_id_collides(const char * id, int exclude_slot) {
-    for (int i = 0; i < plugin_instance_count; i++) {
-        if (i != exclude_slot && plugin_instances[i].defined && strcmp(plugin_instances[i].id, id) == 0) return true;
-    }
-    return false;
-}
-
-static int l_plugin_define(lua_State * L) {
-    luaL_checktype(L, 1, LUA_TTABLE);
-    if (loading_plugin_slot < 0 || loading_plugin_slot >= PLUGIN_MAX_FILES ||
-        plugin_instances[loading_plugin_slot].L != L) {
-        return luaL_error(L, "plugin.define may only be called once during plugin loading");
-    }
-    plugin_instance_t * inst = &plugin_instances[loading_plugin_slot];
-    if (inst->defined) return luaL_error(L, "plugin.define may only be called once");
-
-    lua_getfield(L, 1, "id");
-    const char * id = luaL_checkstring(L, -1);
-    if (!plugin_id_is_valid(id) || strlen(id) >= sizeof(inst->id)) {
-        return luaL_error(L, "plugin.define: id must be 1-%zu characters using letters, digits, '.', '_' or '-'",
-                          sizeof(inst->id) - 1);
-    }
-    if (plugin_id_collides(id, loading_plugin_slot)) {
-        return luaL_error(L, "plugin.define: duplicate plugin id '%s'", id);
-    }
-    snprintf(inst->id, sizeof(inst->id), "%s", id);
-    lua_pop(L, 1);
-
-    lua_getfield(L, 1, "name");
-    const char * name = luaL_optstring(L, -1, id);
-    snprintf(inst->name, sizeof(inst->name), "%s", name);
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "version");
-    const char * version = luaL_optstring(L, -1, "0");
-    snprintf(inst->version, sizeof(inst->version), "%s", version);
-    lua_pop(L, 1);
-    lua_getfield(L, 1, "api_min");
-    lua_Integer api_min = luaL_optinteger(L, -1, 1);
-    lua_pop(L, 1);
-    if (api_min > PLUGIN_API_VERSION) {
-        return luaL_error(L, "plugin '%s' requires API %lld, player provides API %d", id,
-                          (long long) api_min, PLUGIN_API_VERSION);
-    }
-    inst->defined = true;
-    return 0;
-}
-
-static int l_plugin_api_version(lua_State * L) {
-    lua_pushinteger(L, PLUGIN_API_VERSION);
-    return 1;
-}
-
-static const char * const plugin_capabilities[] = {
-    "ui.list", "ui.settings", "ui.row_width", "ui.text_input", "ui.toast", "ui.theme",
-    "filesystem.sd", "playback.control", "playback.state", "playback.events",
-    "library.artist_albums", "library.paged", "network.http.sync", "network.http.async",
-    "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
-    "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
-    "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles", "ui.launcher_layout",
-    "ui.home_background", "audio.gain"
-};
-
-static int l_plugin_has_capability(lua_State * L) {
-    const char * requested = luaL_checkstring(L, 1);
-    bool found = false;
-    for (size_t i = 0; i < sizeof(plugin_capabilities) / sizeof(plugin_capabilities[0]); i++) {
-        if (strcmp(requested, plugin_capabilities[i]) == 0) { found = true; break; }
-    }
-    lua_pushboolean(L, found);
-    return 1;
-}
-
-static int l_plugin_media_capabilities(lua_State * L) {
-    lua_newtable(L);
-
-    lua_newtable(L);
-    lua_pushstring(L, "mp3");  lua_rawseti(L, -2, 1);
-    lua_pushstring(L, "aac");  lua_rawseti(L, -2, 2);
-    lua_pushstring(L, "flac"); lua_rawseti(L, -2, 3);
-    lua_setfield(L, -2, "codecs");
-
-    lua_newtable(L);
-    lua_pushstring(L, "mp3");  lua_rawseti(L, -2, 1);
-    lua_pushstring(L, "adts"); lua_rawseti(L, -2, 2);
-    lua_pushstring(L, "flac"); lua_rawseti(L, -2, 3);
-    lua_setfield(L, -2, "containers");
-
-    lua_pushinteger(L, 0);  lua_setfield(L, -2, "max_sample_rate");
-    lua_pushinteger(L, 16); lua_setfield(L, -2, "max_bit_depth");
-    lua_pushinteger(L, 2);  lua_setfield(L, -2, "max_channels");
-
-    lua_pushboolean(L, true);  lua_setfield(L, -2, "direct_http_streaming");
-    lua_pushboolean(L, false); lua_setfield(L, -2, "range_seeking");
-    lua_pushboolean(L, false); lua_setfield(L, -2, "hls");
-    lua_pushboolean(L, false); lua_setfield(L, -2, "dash");
-
-    lua_newtable(L); lua_setfield(L, -2, "encryption_modes");
-    lua_newtable(L); lua_setfield(L, -2, "drm_systems");
-
-    return 1;
-}
-
-static int l_plugin_storage_get(lua_State * L) {
-    const char * id = require_plugin_id(L);
-    const char * key = luaL_checkstring(L, 1);
-    char * value = NULL;
-    size_t value_len = 0;
-    if (plugin_storage_get(id, key, &value, &value_len)) {
-        lua_pushlstring(L, value, value_len);
-        free(value);
-        return 1;
-    }
-    if (lua_gettop(L) >= 2) {
-        lua_pushvalue(L, 2);
-        return 1;
-    }
-    lua_pushnil(L);
-    return 1;
-}
-
-static int l_plugin_storage_set(lua_State * L) {
-    const char * id = require_plugin_id(L);
-    const char * key = luaL_checkstring(L, 1);
-    size_t value_len = 0;
-    const char * value = luaL_checklstring(L, 2, &value_len);
-    if (!plugin_storage_set(id, key, value, value_len)) {
-        lua_pushboolean(L, false);
-        lua_pushstring(L, "plugin.storage.set failed");
-        return 2;
-    }
-    lua_pushboolean(L, true);
-    return 1;
-}
-
-static int l_plugin_storage_delete(lua_State * L) {
-    const char * id = require_plugin_id(L);
-    const char * key = luaL_checkstring(L, 1);
-    lua_pushboolean(L, plugin_storage_delete(id, key));
-    return 1;
-}
-
-static int l_plugin_storage_list(lua_State * L) {
-    const char * id = require_plugin_id(L);
-    const char * prefix = luaL_optstring(L, 1, "");
-    char ** keys = NULL;
-    int count = plugin_storage_list(id, prefix, &keys);
-    if (count < 0) {
-        lua_pushnil(L);
-        lua_pushstring(L, "plugin.storage.list failed");
-        return 2;
-    }
-    lua_newtable(L);
-    for (int i = 0; i < count; i++) {
-        lua_pushstring(L, keys[i]);
-        lua_rawseti(L, -2, i + 1);
-        free(keys[i]);
-    }
-    free(keys);
-    return 1;
-}
-
-static int l_plugin_secrets_set(lua_State * L) {
-    const char * id = require_plugin_id(L);
-    const char * key = luaL_checkstring(L, 1);
-    size_t value_len = 0;
-    const char * value = luaL_checklstring(L, 2, &value_len);
-    lua_pushboolean(L, plugin_secrets_set(id, key, value, value_len));
-    return 1;
-}
-
-static int l_plugin_secrets_exists(lua_State * L) {
-    const char * id = require_plugin_id(L);
-    const char * key = luaL_checkstring(L, 1);
-    lua_pushboolean(L, plugin_secrets_exists(id, key));
-    return 1;
-}
-
-static int l_plugin_secrets_delete(lua_State * L) {
-    const char * id = require_plugin_id(L);
-    const char * key = luaL_checkstring(L, 1);
-    lua_pushboolean(L, plugin_secrets_delete(id, key));
-    return 1;
-}
-
-static int l_plugin_get_app_info(lua_State * L) {
-    lua_newtable(L);
-    lua_pushstring(L, app_version_label()); lua_setfield(L, -2, "version");
-    lua_pushstring(L, app_build_identifier()); lua_setfield(L, -2, "build");
+void audio_init(void) {
 #ifdef HOST_BUILD
-    lua_pushstring(L, "host");
-#else
-    lua_pushstring(L, "hiby-r1");
+    SDL_InitSubSystem(SDL_INIT_AUDIO);
 #endif
-    lua_setfield(L, -2, "platform");
-    lua_pushinteger(L, PLUGIN_API_VERSION); lua_setfield(L, -2, "plugin_api");
-    return 1;
-}
+    peq_init();
 
-static const luaL_Reg plugin_funcs[] = {
-    { "define",                    l_plugin_define },
-    { "api_version",               l_plugin_api_version },
-    { "has_capability",            l_plugin_has_capability },
-    { "get_app_info",              l_plugin_get_app_info },
-    { "register_list_item",        l_plugin_register_list_item },
-    { "register_stream_media_tile", l_plugin_register_stream_media_tile },
-    { "register_home_tile",        l_plugin_register_home_tile },
-    { "show_list",                 l_plugin_show_list },
-    { "show_settings_list",        l_plugin_show_settings_list },
-    { "list_dir",                  l_plugin_list_dir },
-    { "sd_root",                   l_plugin_sd_root },
-    { "playlist_list",             l_plugin_playlist_list },
-    { "playlist_read",             l_plugin_playlist_read },
-    { "playlist_create",           l_plugin_playlist_create },
-    { "playlist_add",              l_plugin_playlist_add },
-    { "playlist_remove",           l_plugin_playlist_remove },
-    { "playlist_delete",           l_plugin_playlist_delete },
-    { "mkdir",                     l_plugin_mkdir },
-    { "play_file",                 l_plugin_play_file },
-    { "play_list",                 l_plugin_play_list },
-    { "play_remote",               l_plugin_play_remote },
-    { "queue_remote_list",         l_plugin_queue_remote_list },
-    { "show_toast",                l_plugin_show_toast },
-    { "set_gain",                  l_plugin_set_gain },
-    { "get_gain",                  l_plugin_get_gain },
-    { "set_icon",                  l_plugin_set_icon },
-    { "set_background_color",      l_plugin_set_background_color },
-    { "set_text_color",            l_plugin_set_text_color },
-    { "set_home_layout",           l_plugin_set_home_layout },
-    { "set_launcher_layout",       l_plugin_set_launcher_layout },
-    { "refresh_theme",             l_plugin_refresh_theme },
-    { "reload_ui",                 l_plugin_reload_ui },
-    { "eq_load_profile",           l_plugin_eq_load_profile },
-    { "eq_save_profile",           l_plugin_eq_save_profile },
-    { "eq_reset",                  l_plugin_eq_reset },
-    { "eq_set_bypass",             l_plugin_eq_set_bypass },
-    { "eq_set_preamp",             l_plugin_eq_set_preamp },
-    { "eq_set_band",               l_plugin_eq_set_band },
-    { "eq_set_band_type",          l_plugin_eq_set_band_type },
-    { "eq_set_band_enabled",       l_plugin_eq_set_band_enabled },
-    { "toggle_pause",              l_plugin_toggle_pause },
-    { "stop",                      l_plugin_stop },
-    { "next_track",                l_plugin_next_track },
-    { "prev_track",                l_plugin_prev_track },
-    { "seek",                      l_plugin_seek },
-    { "set_volume",                l_plugin_set_volume },
-    { "is_playing",                l_plugin_is_playing },
-    { "is_paused",                 l_plugin_is_paused },
-    { "get_position",              l_plugin_get_position },
-    { "get_duration",              l_plugin_get_duration },
-    { "http_get",                  l_plugin_http_get },
-    { "http_post",                 l_plugin_http_post },
-    { "http_request",              l_plugin_http_request },
-    { "download_file_async",       l_plugin_download_file_async },
-    { "cancel",                    l_plugin_cancel },
-    { "md5",                       l_plugin_md5 },
-    { "json_decode",               l_plugin_json_decode },
-    { "json_encode",               l_plugin_json_encode },
-    { "media_capabilities",        l_plugin_media_capabilities },
-    { "show_text_input",           l_plugin_show_text_input },
-    { "get_now_playing",           l_plugin_get_now_playing },
-    { "get_play_mode",             l_plugin_get_play_mode },
-    { "get_current_track_path",    l_plugin_get_current_track_path },
-    { "get_artist_albums",         l_plugin_get_artist_albums },
-    { "get_album_tracks",          l_plugin_get_album_tracks },
-    { "get_next_album_tracks",     l_plugin_get_next_album_tracks },
-    { "library_song_count",        l_plugin_library_song_count },
-    { "library_get_songs",         l_plugin_library_get_songs },
-    { "library_search",            l_plugin_library_search },
-    { "library_get_song",          l_plugin_library_get_song },
-    { "library_get_artists",       l_plugin_library_get_artists },
-    { "library_get_albums",        l_plugin_library_get_albums },
-    { "refresh_library",           l_plugin_refresh_library },
-    { "on",                        l_plugin_on },
-    { "set_interval",              l_plugin_set_interval },
-    { "clear_interval",            l_plugin_clear_interval },
-    { NULL, NULL }
-};
-
-static const luaL_Reg plugin_storage_funcs[] = {
-    { "get",    l_plugin_storage_get },
-    { "set",    l_plugin_storage_set },
-    { "delete", l_plugin_storage_delete },
-    { "list",   l_plugin_storage_list },
-    { NULL, NULL }
-};
-
-static const luaL_Reg plugin_secrets_funcs[] = {
-    { "set",    l_plugin_secrets_set },
-    { "exists", l_plugin_secrets_exists },
-    { "delete", l_plugin_secrets_delete },
-    { NULL, NULL }
-};
-
-#define PLUGIN_CALL_MAX_MS 2000
-
-static struct timespec plugin_call_deadline_start;
-
-static void plugin_call_exclude_native_elapsed(const struct timespec * started) {
-    struct timespec ended;
-    clock_gettime(CLOCK_MONOTONIC, &ended);
-    time_t sec = ended.tv_sec - started->tv_sec;
-    long nsec = ended.tv_nsec - started->tv_nsec;
-    if (nsec < 0) { sec--; nsec += 1000000000L; }
-    plugin_call_deadline_start.tv_sec += sec;
-    plugin_call_deadline_start.tv_nsec += nsec;
-    if (plugin_call_deadline_start.tv_nsec >= 1000000000L) {
-        plugin_call_deadline_start.tv_sec++;
-        plugin_call_deadline_start.tv_nsec -= 1000000000L;
+    if (!thread_started) {
+        thread_started = true;
+        pthread_create(&audio_thread, NULL, audio_thread_func, NULL);
     }
 }
 
-static int plugin_call_native(lua_State * L, lua_CFunction fn) {
-    int nargs = lua_gettop(L);
-    struct timespec started;
-    clock_gettime(CLOCK_MONOTONIC, &started);
-    lua_pushcfunction(L, fn);
-    lua_insert(L, 1);
-    int rc = lua_pcall(L, nargs, LUA_MULTRET, 0);
-    plugin_call_exclude_native_elapsed(&started);
-    if (rc != LUA_OK) return lua_error(L);
-    return lua_gettop(L);
+void audio_play_file_at(const char * path, double start_seconds,
+                         bool has_replaygain, double replaygain_gain_db,
+                         bool has_replaygain_peak, double replaygain_peak) {
+    pthread_mutex_lock(&audio_mutex);
+    free(restart_path);
+    restart_path = strdup(path);
+    restart_start_seconds = start_seconds;
+    restart_replaygain_linear = (float) replaygain_to_linear(has_replaygain, replaygain_gain_db, has_replaygain_peak, replaygain_peak);
+    restart_replaygain_applied = has_replaygain;
+    free(next_path);
+    next_path = NULL; /* the caller re-arms this via audio_set_next_track() right after */
+    restart_requested = true;
+    stop_requested = false;
+    paused = false;
+    track_finished = false;
+    track_advanced = false;
+    last_playback_error = AUDIO_ERROR_NONE;
+    last_playback_error_generation = 0;
+    playback_generation++;
+    seek_pending = false;
+    free(active_path);
+    active_path = strdup(path);
+    clear_current_format_locked();
+    pthread_cond_signal(&audio_cond);
+    pthread_mutex_unlock(&audio_mutex);
 }
 
-static int l_plugin_api_guard(lua_State * L) {
-    return plugin_call_native(L, lua_tocfunction(L, lua_upvalueindex(1)));
+void audio_set_next_track(const char * path, bool has_replaygain, double replaygain_gain_db,
+                           bool has_replaygain_peak, double replaygain_peak) {
+    pthread_mutex_lock(&audio_mutex);
+    free(next_path);
+    next_path = path ? strdup(path) : NULL;
+    next_replaygain_linear = (float) replaygain_to_linear(has_replaygain, replaygain_gain_db, has_replaygain_peak, replaygain_peak);
+    next_replaygain_applied = has_replaygain;
+    /* Increment generation so any in-flight snapshot the playback thread
+     * already took (for a crossfade prefetch) is detected as stale and
+     * discarded when the blend window arrives. */
+    next_track_generation++;
+    pthread_mutex_unlock(&audio_mutex);
 }
 
-static void register_plugin_lib(lua_State * L, const luaL_Reg * regs) {
-    lua_newtable(L);
-    for (; regs->name != NULL; regs++) {
-        lua_pushcfunction(L, regs->func);
-        lua_pushcclosure(L, l_plugin_api_guard, 1);
-        lua_setfield(L, -2, regs->name);
-    }
+void audio_set_crossfade_enabled(bool enabled) {
+    pthread_mutex_lock(&audio_mutex);
+    crossfade_enabled = enabled;
+    pthread_mutex_unlock(&audio_mutex);
 }
 
-static void register_plugin_api(lua_State * L) {
-    register_plugin_lib(L, plugin_funcs);
-    register_plugin_lib(L, plugin_storage_funcs);
-    lua_setfield(L, -2, "storage");
-    register_plugin_lib(L, plugin_secrets_funcs);
-    lua_setfield(L, -2, "secrets");
-    lua_setglobal(L, "plugin");
+void audio_set_low_power_mode(bool enabled) {
+    pthread_mutex_lock(&audio_mutex);
+    low_power_mode = enabled;
+    pthread_mutex_unlock(&audio_mutex);
 }
 
-static lua_CFunction real_io_open = NULL;
-static lua_CFunction real_io_lines = NULL;
-static lua_CFunction real_io_input = NULL;
-static lua_CFunction real_io_output = NULL;
-static lua_CFunction real_os_remove = NULL;
-static lua_CFunction real_os_rename = NULL;
-
-static int l_guarded_io_open(lua_State * L) {
-    const char * path = luaL_optstring(L, 1, "");
-    if (plugin_storage_path_is_reserved(path)) {
-        lua_pushnil(L);
-        lua_pushliteral(L, "io.open: path is reserved for plugin.storage/plugin.secrets");
-        return 2;
-    }
-    return plugin_call_native(L, real_io_open);
+void audio_set_bt_output(bool enabled) {
+#ifndef HOST_BUILD
+    /* No lock: audio_output.c's own bt_requested flag is only ever read by
+     * whichever single thread currently owns the output device (this
+     * app's own playback thread, or usb_dac_bridge.c's bridge thread --
+     * see audio_output.h's own comment on why only one is ever active at
+     * a time) -- a stale read here just means the output switch lands on
+     * the next audio_output_ensure() call instead of immediately, not a
+     * correctness bug. */
+    audio_output_set_bt_requested(enabled);
+#else
+    (void) enabled; /* host build has no Bluetooth output path -- SDL only */
+#endif
 }
 
-static int l_guarded_io_lines(lua_State * L) {
-    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
-        const char * path = lua_tostring(L, 1);
-        if (plugin_storage_path_is_reserved(path)) {
-            return luaL_error(L, "io.lines: path is reserved for plugin.storage/plugin.secrets");
-        }
-    }
-    return plugin_call_native(L, real_io_lines);
+void audio_set_usb_output(bool enabled, const char * alsa_device) {
+#ifndef HOST_BUILD
+    /* Same no-lock reasoning as audio_set_bt_output() right above. */
+    audio_output_set_usb_requested(enabled, alsa_device);
+#else
+    (void) enabled;
+    (void) alsa_device; /* host build has no USB audio-host output path -- SDL only */
+#endif
 }
 
-static int l_guarded_io_input(lua_State * L) {
-    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
-        const char * path = lua_tostring(L, 1);
-        if (plugin_storage_path_is_reserved(path)) {
-            return luaL_error(L, "io.input: path is reserved for plugin.storage/plugin.secrets");
-        }
-    }
-    return plugin_call_native(L, real_io_input);
-}
-
-static int l_guarded_io_output(lua_State * L) {
-    if (lua_gettop(L) >= 1 && lua_isstring(L, 1)) {
-        const char * path = lua_tostring(L, 1);
-        if (plugin_storage_path_is_reserved(path)) {
-            return luaL_error(L, "io.output: path is reserved for plugin.storage/plugin.secrets");
-        }
-    }
-    return plugin_call_native(L, real_io_output);
-}
-
-static int l_guarded_os_remove(lua_State * L) {
-    const char * path = luaL_optstring(L, 1, "");
-    if (plugin_storage_path_is_reserved(path)) {
-        lua_pushnil(L);
-        lua_pushliteral(L, "os.remove: path is reserved for plugin.storage/plugin.secrets");
-        return 2;
-    }
-    return plugin_call_native(L, real_os_remove);
-}
-
-static int l_guarded_os_rename(lua_State * L) {
-    const char * from = luaL_optstring(L, 1, "");
-    const char * to = luaL_optstring(L, 2, "");
-    if (plugin_storage_path_is_reserved(from) || plugin_storage_path_is_reserved(to)) {
-        lua_pushnil(L);
-        lua_pushliteral(L, "os.rename: path is reserved for plugin.storage/plugin.secrets");
-        return 2;
-    }
-    return plugin_call_native(L, real_os_rename);
-}
-
-static void sandbox_plugin_lua_state(lua_State * L) {
-    lua_pushnil(L); lua_setglobal(L, "load");
-    lua_pushnil(L); lua_setglobal(L, "loadstring");
-    lua_pushnil(L); lua_setglobal(L, "loadfile");
-    lua_pushnil(L); lua_setglobal(L, "dofile");
-    lua_pushnil(L); lua_setglobal(L, "require");
-    lua_pushnil(L); lua_setglobal(L, "package");
-    lua_pushnil(L); lua_setglobal(L, "debug");
-
-    lua_getglobal(L, "os");
-    if (lua_istable(L, -1)) {
-        static const char * dangerous_os[] = { "execute", "getenv", "exit", "tmpname" };
-        for (size_t i = 0; i < sizeof(dangerous_os) / sizeof(dangerous_os[0]); i++) {
-            lua_pushnil(L);
-            lua_setfield(L, -2, dangerous_os[i]);
-        }
-
-        lua_getfield(L, -1, "remove");
-        if (lua_iscfunction(L, -1)) real_os_remove = lua_tocfunction(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, -1, "rename");
-        if (lua_iscfunction(L, -1)) real_os_rename = lua_tocfunction(L, -1);
-        lua_pop(L, 1);
-        if (real_os_remove) { lua_pushcfunction(L, l_guarded_os_remove); lua_setfield(L, -2, "remove"); }
-        if (real_os_rename) { lua_pushcfunction(L, l_guarded_os_rename); lua_setfield(L, -2, "rename"); }
-    }
-    lua_pop(L, 1);
-
-    lua_getglobal(L, "io");
-    if (lua_istable(L, -1)) {
-        lua_pushnil(L);
-        lua_setfield(L, -2, "popen");
-
-        lua_getfield(L, -1, "open");
-        if (lua_iscfunction(L, -1)) real_io_open = lua_tocfunction(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, -1, "lines");
-        if (lua_iscfunction(L, -1)) real_io_lines = lua_tocfunction(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, -1, "input");
-        if (lua_iscfunction(L, -1)) real_io_input = lua_tocfunction(L, -1);
-        lua_pop(L, 1);
-        lua_getfield(L, -1, "output");
-        if (lua_iscfunction(L, -1)) real_io_output = lua_tocfunction(L, -1);
-        lua_pop(L, 1);
-        if (real_io_open) { lua_pushcfunction(L, l_guarded_io_open); lua_setfield(L, -2, "open"); }
-        if (real_io_lines) { lua_pushcfunction(L, l_guarded_io_lines); lua_setfield(L, -2, "lines"); }
-        if (real_io_input) { lua_pushcfunction(L, l_guarded_io_input); lua_setfield(L, -2, "input"); }
-        if (real_io_output) { lua_pushcfunction(L, l_guarded_io_output); lua_setfield(L, -2, "output"); }
-    }
-    lua_pop(L, 1);
-}
-
-static void plugin_call_timeout_hook(lua_State * L, lua_Debug * ar) {
-    (void) ar;
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long elapsed_ms = (now.tv_sec - plugin_call_deadline_start.tv_sec) * 1000L +
-                      (now.tv_nsec - plugin_call_deadline_start.tv_nsec) / 1000000L;
-    if (elapsed_ms > PLUGIN_CALL_MAX_MS) {
-        luaL_error(L, "plugin call exceeded %dms time budget -- aborted to keep the UI responsive", PLUGIN_CALL_MAX_MS);
-    }
-}
-
-static int plugin_call(lua_State * L, int nargs, int nresults, int errfunc) {
-    clock_gettime(CLOCK_MONOTONIC, &plugin_call_deadline_start);
-    lua_sethook(L, plugin_call_timeout_hook, LUA_MASKCOUNT, 10000);
-    int result = lua_pcall(L, nargs, nresults, errfunc);
-    lua_sethook(L, NULL, 0, 0);
-    return result;
-}
-
-static void load_plugin_file(const char * path) {
-    lua_State * L = luaL_newstate();
-    if (!L) return;
-    int slot = plugin_instance_count;
-    plugin_instance_t * inst = &plugin_instances[slot];
-    memset(inst, 0, sizeof(*inst));
-    inst->L = L;
-    const char * base = strrchr(path, '/');
-    base = base ? base + 1 : path;
-    snprintf(inst->filename, sizeof(inst->filename), "%s", base);
-    loading_plugin_slot = slot;
-    luaL_openlibs(L);
-    sandbox_plugin_lua_state(L);
-    register_plugin_api(L);
-
-    if ((luaL_loadfile(L, path) || plugin_call(L, 0, LUA_MULTRET, 0)) != LUA_OK) {
-        const char * err = lua_tostring(L, -1);
-        fprintf(stderr, "[plugins] failed to load %s: %s\n", path, err ? err : "unknown error");
-        lua_close(L);
-        memset(inst, 0, sizeof(*inst));
-        loading_plugin_slot = -1;
+void audio_toggle_pause(void) {
+    pthread_mutex_lock(&audio_mutex);
+    if (!have_current) {
+        pthread_mutex_unlock(&audio_mutex);
         return;
     }
+    paused = !paused;
+    bool now_paused = paused;
+    pthread_cond_signal(&audio_cond);
+    pthread_mutex_unlock(&audio_mutex);
 
-    if (!inst->defined) {
-        snprintf(inst->id, sizeof(inst->id), "legacy.%.*s", (int) sizeof(inst->id) - 8, base);
-        char * dot = strrchr(inst->id, '.');
-        if (dot && strcasecmp(dot, ".lua") == 0) *dot = '\0';
-        if (plugin_id_collides(inst->id, slot)) {
-            uint64_t h = 0xcbf29ce484222325ULL;
-            for (const char * p = path; *p; p++) { h ^= (unsigned char) *p; h *= 0x100000001b3ULL; }
-            char base_no_ext[sizeof(inst->id)];
-            snprintf(base_no_ext, sizeof(base_no_ext), "%s", base);
-            char * base_dot = strrchr(base_no_ext, '.');
-            if (base_dot && strcasecmp(base_dot, ".lua") == 0) *base_dot = '\0';
-            snprintf(inst->id, sizeof(inst->id), "legacy.%.*s.%016llx",
-                     (int) sizeof(inst->id) - 7 - 1 - 16 - 1, base_no_ext, (unsigned long long) h);
-            if (plugin_id_collides(inst->id, slot)) {
-                fprintf(stderr, "[plugins] refusing to load %s: generated id '%s' still collides with another plugin's id\n",
-                        path, inst->id);
-                lua_close(L);
-                memset(inst, 0, sizeof(*inst));
-                loading_plugin_slot = -1;
-                return;
-            }
-        }
-        snprintf(inst->name, sizeof(inst->name), "%.*s", (int) sizeof(inst->name) - 1, base);
-        snprintf(inst->version, sizeof(inst->version), "0");
-        inst->defined = true;
+#ifdef HOST_BUILD
+    if (sdl_dev != 0) {
+        SDL_PauseAudioDevice(sdl_dev, now_paused ? 1 : 0);
     }
-    loading_plugin_slot = -1;
-    plugin_instance_count++;
+#else
+    (void) now_paused;
+#endif
 }
 
-static int plugin_filename_cmp(const void * a, const void * b) {
-    return strcmp((const char *) a, (const char *) b);
+void audio_stop(void) {
+    pthread_mutex_lock(&audio_mutex);
+    stop_requested = true;
+    pthread_cond_signal(&audio_cond);
+    pthread_mutex_unlock(&audio_mutex);
 }
 
-static char (*scan_plugin_dir_sorted_names(char dir_path_out[600], int * out_count))[256] {
-    *out_count = 0;
-    snprintf(dir_path_out, 600, "%s/.plugins", MUSIC_ROOT_DIR);
-
-    DIR * d = opendir(dir_path_out);
-    if (!d) return NULL;
-
-    int total = 0;
-    struct dirent * ent;
-    while ((ent = readdir(d)) != NULL) {
-        size_t len = strlen(ent->d_name);
-        if (len < 5 || strcasecmp(ent->d_name + len - 4, ".lua") != 0) continue;
-        total++;
-    }
-    if (total == 0) {
-        closedir(d);
-        return NULL;
-    }
-
-    char (*names)[256] = malloc((size_t) total * sizeof(*names));
-    if (!names) {
-        closedir(d);
-        return NULL;
-    }
-
-    rewinddir(d);
-    int name_count = 0;
-    while (name_count < total && (ent = readdir(d)) != NULL) {
-        size_t len = strlen(ent->d_name);
-        if (len < 5 || strcasecmp(ent->d_name + len - 4, ".lua") != 0) continue;
-        snprintf(names[name_count], sizeof(names[0]), "%s", ent->d_name);
-        name_count++;
-    }
-    closedir(d);
-
-    qsort(names, (size_t) name_count, sizeof(names[0]), plugin_filename_cmp);
-    *out_count = name_count;
-    return names;
+bool audio_is_playing(void) {
+    pthread_mutex_lock(&audio_mutex);
+    bool result = have_current && !paused;
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
 }
 
-void plugin_manager_init(void) {
-    plugin_disabled_list_load();
-
-    char dir_path[600];
-    int name_count = 0;
-    char (*names)[256] = scan_plugin_dir_sorted_names(dir_path, &name_count);
-    if (!names) return;
-
-    int enabled_count = 0;
-    for (int i = 0; i < name_count; i++) {
-        if (plugin_disabled_list_contains(names[i])) continue;
-        if (enabled_count != i) memcpy(names[enabled_count], names[i], sizeof(names[0]));
-        enabled_count++;
-    }
-
-    int load_count = (enabled_count > PLUGIN_MAX_FILES) ? PLUGIN_MAX_FILES : enabled_count;
-    for (int i = 0; i < load_count; i++) {
-        if (plugin_instance_count >= PLUGIN_MAX_FILES) break;
-        char full_path[700];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, names[i]);
-        load_plugin_file(full_path);
-    }
-    free(names);
+bool audio_is_paused(void) {
+    pthread_mutex_lock(&audio_mutex);
+    bool result = have_current && paused;
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
 }
 
-static void fill_available_entry(plugin_available_entry_t * e, const char * filename) {
-    snprintf(e->filename, sizeof(e->filename), "%s", filename);
-    e->disabled = plugin_disabled_list_contains(filename);
-    e->loaded = false;
-    snprintf(e->display_name, sizeof(e->display_name), "%s", filename);
-
-    for (int j = 0; j < plugin_instance_count; j++) {
-        if (strcmp(plugin_instances[j].filename, filename) == 0) {
-            e->loaded = true;
-            snprintf(e->display_name, sizeof(e->display_name), "%s", plugin_instances[j].name);
-            break;
-        }
-    }
+/* Publish a coalesced command and wake the playback thread. Always called
+ * with audio_mutex held and returns with it unlocked. */
+static void finish_seek_request_and_unlock(void) {
+    seek_pending = true;
+    pthread_cond_broadcast(&audio_cond);
+    pthread_mutex_unlock(&audio_mutex);
 }
 
-int plugin_manager_scan_available(plugin_available_entry_t * out, int max) {
-    char dir_path[600];
-    int name_count = 0;
-    char (*names)[256] = scan_plugin_dir_sorted_names(dir_path, &name_count);
-    if (!names) return 0;
+static void request_seek_and_unlock(uint64_t frame) {
+    if (frame > current_total_frames) frame = current_total_frames;
+    seek_pending_frame = frame;
+    seek_pending_is_percent = false;
+    seek_pending_playback_generation = playback_generation;
+    finish_seek_request_and_unlock();
+}
 
-    int count = 0;
-    if (name_count <= max) {
-        for (int i = 0; i < name_count; i++) fill_available_entry(&out[count++], names[i]);
+void audio_seek(double seconds) {
+    pthread_mutex_lock(&audio_mutex);
+    if (!have_current || current_sample_rate == 0 || current_total_frames == 0 || !active_path ||
+        (current_format_info.valid && current_format_info.is_stream)) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
+    }
+    if (!isfinite(seconds)) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
+    }
+    if (seconds < 0.0) seconds = 0.0;
+    double duration = (double) current_total_frames / (double) current_sample_rate;
+    if (seconds > duration) seconds = duration;
+    uint64_t frame = (uint64_t) (seconds * (double) current_sample_rate);
+    request_seek_and_unlock(frame);
+}
+
+/* Real-device bug report: tapping the progress slider to seek stopped
+ * working after switching tracks a few times, mostly on 40+ minute songs.
+ * Root cause: progress_slider_event_cb() (gui_player.c) used to read
+ * audio_get_duration_seconds(), convert the tapped percent to an absolute
+ * seconds value, and call audio_seek(seconds) -- two SEPARATE audio_mutex
+ * critical sections, with the audio thread free to run in between. If the
+ * user switches tracks and then taps the slider before the audio thread's
+ * own decoder_open() for the new track has finished (current_sample_rate/
+ * current_total_frames only update once it has -- see the restart handling
+ * at the top of audio_thread_func()'s outer loop), audio_get_duration_
+ * seconds() still reports the OLD track's duration. A percent computed
+ * against that stale duration, then converted to a frame count using
+ * whichever track's current_sample_rate audio_seek() happens to observe by
+ * the time its own separate lock acquisition runs, lands on the wrong
+ * position in the NEW track -- and can look like the tap did nothing at
+ * all if that miscomputed target happens to clamp back near wherever
+ * playback already was. decoder_open() takes measurably longer for a long
+ * file needing to scan/build a seek index (most formats here) than for one
+ * whose header states total_frames outright (FLAC's STREAMINFO), which is
+ * why this was mostly seen on 40+ minute songs and not reported for FLAC.
+ *
+ * Fix: store the percentage together with playback_generation. The playback
+ * thread converts it using the decoder for that same generation. It
+ * therefore cannot combine the previous track's duration with the newly
+ * requested track's path. */
+void audio_seek_percent(double percent) {
+    pthread_mutex_lock(&audio_mutex);
+    if (!active_path || (current_format_info.valid && current_format_info.is_stream)) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
+    }
+    if (!isfinite(percent)) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
+    }
+    if (percent < 0.0) percent = 0.0;
+    if (percent > 100.0) percent = 100.0;
+    seek_pending_percent = percent;
+    seek_pending_is_percent = true;
+    seek_pending_playback_generation = playback_generation;
+    finish_seek_request_and_unlock();
+}
+
+double audio_get_position_seconds(void) {
+    pthread_mutex_lock(&audio_mutex);
+    double result = (current_sample_rate != 0)
+        ? (double) frames_played / (double) current_sample_rate
+        : 0.0;
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
+}
+
+double audio_get_resume_position_seconds(void) {
+    pthread_mutex_lock(&audio_mutex);
+    double result;
+    if (mp3_seek_deferred && mp3_seek_deferred_generation == playback_generation &&
+        mp3_seek_deferred_sample_rate > 0) {
+        result = (double) mp3_seek_deferred_frame /
+                 (double) mp3_seek_deferred_sample_rate;
     } else {
-        bool * included = calloc((size_t) name_count, sizeof(bool));
-        if (!included) { free(names); return 0; }
-
-        for (int i = 0; i < name_count && count < max; i++) {
-            bool is_loaded = false;
-            for (int j = 0; j < plugin_instance_count; j++) {
-                if (strcmp(plugin_instances[j].filename, names[i]) == 0) { is_loaded = true; break; }
-            }
-            if (is_loaded) {
-                fill_available_entry(&out[count++], names[i]);
-                included[i] = true;
-            }
-        }
-        for (int i = 0; i < name_count && count < max; i++) {
-            if (!included[i]) fill_available_entry(&out[count++], names[i]);
-        }
-        free(included);
+        result = current_sample_rate != 0
+            ? (double) frames_played / (double) current_sample_rate : 0.0;
     }
-
-    free(names);
-    return count;
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
 }
 
-void plugin_manager_cancel_all_async_http(void) {
-    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
-        plugin_async_http_t * req = &plugin_async_http[i];
-        if (!req->active) continue;
-        http_cancel_token_cancel(&req->cancel);
-        pthread_join(req->thread, NULL);
-        luaL_unref(req->L, LUA_REGISTRYINDEX, req->callback_ref);
-        free(req->response_body);
-        req->response_body = NULL;
-        req->response_body_size = 0;
-        req->active = false;
-        atomic_store(&req->done, false);
-        http_cancel_token_destroy(&req->cancel);
-        req->L = NULL;
-        req->callback_ref = LUA_NOREF;
+double audio_get_duration_seconds(void) {
+    pthread_mutex_lock(&audio_mutex);
+    double result = (current_sample_rate != 0)
+        ? (double) current_total_frames / (double) current_sample_rate
+        : 0.0;
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
+}
+
+unsigned int audio_get_sample_rate(void) {
+    pthread_mutex_lock(&audio_mutex);
+    unsigned int result = current_sample_rate;
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
+}
+
+bool audio_get_current_format_info(audio_current_format_info_t * out) {
+    if (!out) return false;
+    pthread_mutex_lock(&audio_mutex);
+    bool valid = have_current && current_format_info.valid;
+    if (valid) *out = current_format_info;
+    else memset(out, 0, sizeof(*out));
+    pthread_mutex_unlock(&audio_mutex);
+    return valid;
+}
+
+/* Human loudness perception is roughly logarithmic, so a raw linear
+ * amplitude scale (gain == percent) crams nearly the entire perceptible
+ * range into the bottom ~10-20% of the slider and makes the rest barely
+ * distinguishable -- real-device feedback comparing against stock: "volume
+ * on 2 corresponds to volume in 20 on the stock OS", i.e. stock isn't
+ * linear either. This maps the UI's 0-100% onto MIN_VOLUME_DB..0dB
+ * linearly in dB (the standard "audio taper" essentially all real volume
+ * controls use) and converts that to the actual linear multiplier
+ * apply_gain() needs. 0% is always true silence, not just -50dB.
+ *
+ * Real-device feedback, two rounds: first "setting it to 1 is equivalent of
+ * setting it to 15/20 in the stock player" (low settings too loud), then --
+ * after a first attempt at a fix that reshaped this into a curve via a
+ * TAPER_EXPONENT < 1 on (1-percent), keeping it closer to the MIN_VOLUME_DB
+ * floor for a larger share of the low end -- "volume from 1% to 20% is
+ * almost the same with unnoticeable change", because that exponent
+ * compressed the wrong thing: it reduced absolute loudness at low percents,
+ * but it also compressed the dB *spacing* between adjacent low percents
+ * (1% and 20% landed only ~5dB apart instead of the plain linear taper's
+ * ~9.5dB), which is the opposite of what "too loud, and also want to still
+ * be able to tell settings apart" calls for. Reverted the exponent entirely
+ * -- back to a plain, equal-dB-per-percent linear taper, which is what
+ * actually preserves even, distinguishable steps -- and widened the floor
+ * itself instead (-50dB to -70dB) so a given low percent is genuinely
+ * quieter in absolute terms without touching how much the curve moves per
+ * percent point. At 1%: -69.3dB (was -49.5dB). At 20%: -56dB (was -40dB) --
+ * a ~13dB gap between those two, comfortably audible, instead of the
+ * exponent version's ~5dB. Still a best-effort widening pending real
+ * side-by-side percent/step reference points against stock, not a precise
+ * fit. */
+#define MIN_VOLUME_DB (-70.0)
+/* Real-device comparison against stock: stock's own max volume was audibly
+ * louder than ours at the time, when this taper's 100% still meant exactly
+ * 1.0x (0dB) digital gain with the hardware DAC's own "Left"/"Right Playback
+ * Volume" registers believed to be unusable (raw 0, thought to be their only
+ * usable setting). A digital-only +6dB boost zone at the top of the slider
+ * was added to close that gap, then later removed once the hardware
+ * registers turned out to be a real, working attenuator after all (see
+ * volume_db_to_hw_raw()'s own comment) -- with hardware actually carrying
+ * the taper down from raw 0 (its own loudest point, confirmed live to
+ * already be louder than stock's own boosted max), there was no gap left
+ * to close, and live listening confirmed the digital boost only added noise
+ * without a worthwhile loudness gain on top of that. apply_gain() still
+ * hard-clips any sample that would overflow int16 range rather than
+ * wrapping, for replaygain or any other gain source that can exceed unity. */
+/* Real-device stock-player calibration (2026-08-18): this app's 50% was
+ * reported to match only about 27% on the stock player, and most of the
+ * useful loudness arrived abruptly above 75%. Modeling that measured
+ * mapping as stock = ours^k gives k=log(.27)/log(.50)=1.889; applying its
+ * inverse (1/k ~= .529) before the existing equal-dB taper makes a UI value
+ * represent approximately the same perceived position as stock. Rounded to
+ * 0.53 rather than pretending the ear comparison has laboratory precision.
+ *
+ * Resulting anchors (versus the old linear-dB curve): 25% -36.4dB (was
+ * -52.5), 50% -21.5dB (was -35), 75% -9.9dB (was -17.5), 100% 0dB. This
+ * raises the previously unusable low/mid range while flattening dB spacing
+ * near the top, eliminating the perceived >75% surge. 0% remains handled
+ * separately as true silence, so pow(0, exponent) never compromises mute. */
+#define VOLUME_CURVE_EXPONENT 0.53
+
+static double calibrated_taper_db(double percent) {
+    if (percent <= 0.0) return MIN_VOLUME_DB;
+    if (percent >= 1.0) return 0.0;
+    return MIN_VOLUME_DB * (1.0 - pow(percent, VOLUME_CURVE_EXPONENT));
+}
+
+/* Real-device investigation: applying this entire taper digitally (the only
+ * option before this) shrinks the *used* range of a 16-bit PCM sample at low
+ * volumes, which is audible as noise -- a real complaint ("noticeable noise
+ * in the lower end"). The codec's own "Left"/"Right Playback Volume" ALSA
+ * controls (raw 0-255, no TLV/dB scale published -- `amixer contents` shows
+ * `access=rw------`, no R flag) turn out to be a real, working hardware
+ * attenuator, despite `amixer cget` making them look broken: cget always
+ * reports 0 no matter what was last written (confirmed live, same-shell
+ * write-then-read-back), but the write itself demonstrably reaches the DAC
+ * and audibly changes output level -- confirmed live, ear-to-speaker, at
+ * several raw values with real playback running and both channels
+ * independently verified. Raw 0 is the loudest point (no attenuation);
+ * increasing raw attenuates further, reaching full silence around raw 230
+ * (~90% of the register's range) -- also confirmed live.
+ *
+ * HW_VOLUME_DB_PER_STEP is an ESTIMATE, not a measured constant -- there is
+ * no TLV, no datasheet, and no SPL meter available. It's derived from a
+ * single live A/B: raw ~191 (75% of range) was reported as "barely
+ * audible, matching stock's 5-10%", and this taper's own
+ * the then-current linear taper at 7.5% worked out to about -64.75dB, giving roughly
+ * 0.34dB per raw step. Treat this as a first-pass calibration that will
+ * very likely need live tuning against real listening feedback, the same
+ * way MIN_VOLUME_DB above needed two rounds before it matched
+ * expectations. That history predates the later stock-player calibration
+ * implemented by calibrated_taper_db() below; unlike the earlier guessed
+ * exponent, the new exponent is derived from a measured 50%=stock-27%
+ * anchor and deliberately corrects the opposite problem (low/mid range too
+ * quiet, with loudness crowded above 75%). */
+#define HW_VOLUME_DB_PER_STEP 0.34
+#define HW_VOLUME_MAX_RAW 230 /* confirmed live: full silence by here */
+
+static int volume_db_to_hw_raw(double db) {
+    if (db >= 0.0) return 0; /* hardware's loudest point -- can't go past it */
+    int raw = (int) lround(-db / HW_VOLUME_DB_PER_STEP);
+    if (raw > HW_VOLUME_MAX_RAW) raw = HW_VOLUME_MAX_RAW;
+    return raw;
+}
+
+/* Plugin-supplied alternative to volume_db_to_hw_raw()/calibrated_taper_db()
+ * above -- lets a plugin own the entire UI-volume -> hardware-register
+ * mapping (e.g. to reproduce a real device's own Low/Medium/High Gain
+ * curves, or any other custom curve) instead of this app's own single
+ * built-in taper. HW_VOLUME_CURVE_LEN (audio.h, shared with
+ * plugin_manager.c's own validation) matches the real stock firmware's
+ * own per-gain-mode table shape (ot_devices.json's VOLUMES[0].Gains[*],
+ * one entry per UI volume 0-100 inclusive), not an arbitrary choice --
+ * see audio_set_custom_hw_volume_curve()'s own doc comment in audio.h.
+ *
+ * LIVE state -- the only pair compute_hw_raw() below ever reads. Mutated
+ * ONLY by audio_set_custom_hw_volume_curve() (the immediate, live-plugin-
+ * callback path) and audio_commit_hw_volume_curve() (which installs
+ * whatever is currently staged, see the STAGED pair right below) --
+ * NEVER directly by audio_stage_custom_hw_volume_curve(). This separation
+ * is what actually keeps a concurrent volume-slider request (processed
+ * on audio_request_volume()'s own background worker thread, which can
+ * call audio_apply_volume() -- an unconditional, immediate hardware
+ * write -- at any moment) from ever reading or writing a plugin (re)load
+ * transaction's not-yet-committed intermediate state; see
+ * audio_stage_custom_hw_volume_curve()'s own doc comment in audio.h for
+ * the full reasoning. */
+static bool custom_hw_curve_active = false;
+static uint8_t custom_hw_curve[HW_VOLUME_CURVE_LEN];
+
+/* STAGED state -- plugin_manager.c's own (re)load-transaction scratch
+ * space. Mutated freely during a transaction (plugin_manager_deinit()'s
+ * own reset, each plugin's own set_hw_volume_curve() calls during its own
+ * top-level run, a failed plugin's rollback to an earlier snapshot) with
+ * zero effect on the LIVE pair above -- and so zero effect on
+ * compute_hw_raw()/audio_apply_volume() -- until
+ * audio_commit_hw_volume_curve() installs it. Zero-initialized to
+ * "inactive/native", same as the live pair, which is exactly correct for
+ * the very first plugin_manager_init() at boot (no preceding
+ * plugin_manager_deinit() call to stage anything first). */
+static bool staged_hw_curve_active = false;
+static uint8_t staged_hw_curve[HW_VOLUME_CURVE_LEN];
+
+/* Hardware carries the whole taper (see volume_db_to_hw_raw()'s own comment
+ * for the real-device investigation behind this); digital gain stays
+ * pinned at unity throughout, including 100%, which lands at raw 0 /
+ * digital 1.0 -- the hardware's own loudest point. A digital boost mode
+ * that pushed louder than that was tried and removed: raw 0 alone was
+ * already confirmed live to be as loud as, or louder than, stock's own
+ * "boosted" max, and adding digital gain on top of it only brought back
+ * the same digital-attenuation-shaped noise this whole redesign exists to
+ * avoid, for no worthwhile loudness gain. */
+/* Real-device bug report: volume did nothing with a USB headphone/DAC
+ * connected. Hardware attenuation (audio_output_request_hw_volume_raw() below)
+ * only ever reaches this device's own internal codec -- USB output instead
+ * pipes raw PCM to a separate `aplay -D plughw:<card>,0` process/ALSA card
+ * that never touches that mixer (see audio_output_is_usb_active()'s own
+ * comment in audio_output.h). The hardware write and unity-gain pin below
+ * still run unconditionally first, exactly as before (a harmless no-op for
+ * USB, and for Bluetooth too, and still correct for local output) -- only
+ * for USB specifically is volume_gain then overwritten with a real digital
+ * taper afterward. Deliberately NOT applied for Bluetooth: an earlier
+ * attempt applied this same digital fallback whenever output wasn't local
+ * (Bluetooth included) and was reverted after a real-device report of
+ * double-attenuated (too quiet) Bluetooth audio -- Bluetooth volume is
+ * already handled by a completely separate, working AVRCP-based mechanism
+ * (bluetooth_control.c's bt_source_vol_sync_thread_func()) that has
+ * nothing to do with this app's own PCM gain, so it must be left alone. */
+/* Shared by audio_apply_volume(), audio_set_custom_hw_volume_curve(), and
+ * audio_commit_hw_volume_curve() below -- factored out (rather than
+ * duplicated) so they can't drift apart. Caller must already hold
+ * audio_mutex. Reads ONLY the LIVE custom_hw_curve_active/custom_hw_curve
+ * pair, never the separate STAGED one -- see that pair's own comment,
+ * right above, for why that separation is required. */
+static int compute_hw_raw(float vol) {
+    if (custom_hw_curve_active) {
+        /* curve[0] stands in for the native-taper branch's own
+         * HW_VOLUME_MAX_RAW mute case -- a plugin curve owns its own
+         * index-0 entry entirely (real device curves put an explicit,
+         * possibly different, mute-register value there rather than
+         * reusing this app's native constant). */
+        int idx = (vol <= 0.0f) ? 0 : (int) lround((double) vol * 100.0);
+        if (idx < 0) idx = 0;
+        if (idx > 100) idx = 100;
+        return custom_hw_curve[idx];
     }
+    return (vol <= 0.0f) ? HW_VOLUME_MAX_RAW : volume_db_to_hw_raw(calibrated_taper_db((double) vol));
 }
 
-static void deinit_diag(const char * step) {
-    int fd = open("/data/mnt/sd_0/reload_diag.log", O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-    if (fd < 0) return;
-    char line[224];
-    int len = snprintf(line, sizeof(line), "[pid=%ld] %s\n", (long) getpid(), step);
-    if (len > 0) {
-        if (len >= (int) sizeof(line)) len = (int) sizeof(line) - 1;
-        write(fd, line, (size_t) len);
-        fsync(fd);
+/* Apply only if no newer synchronous or queued request has superseded this
+ * generation. The check and state update share audio_mutex, so a worker
+ * that races a release-time audio_set_volume() cannot restore an older
+ * drag sample afterward. */
+static void audio_apply_volume(float new_volume, unsigned int generation) {
+    if (new_volume < 0.0f) new_volume = 0.0f;
+    if (new_volume > 1.0f) new_volume = 1.0f;
+    pthread_mutex_lock(&audio_mutex);
+    if (atomic_load(&volume_set_generation) != generation) {
+        pthread_mutex_unlock(&audio_mutex);
+        return;
     }
-    close(fd);
-}
-
-void plugin_manager_deinit(void) {
-    deinit_diag("plugin_manager_deinit: reset_home_layout before");
-    gui_plugin_reset_home_layout();
-    gui_plugin_reset_launcher_layout();
-    deinit_diag("plugin_manager_deinit: cancel_all_async_http before");
-    plugin_manager_cancel_all_async_http();
-    deinit_diag("plugin_manager_deinit: cancel_all_async_http after");
-
-    for (int i = 0; i < PLUGIN_MAX_INTERVALS; i++) {
-        if (!plugin_intervals[i].active) continue;
-        char msg[96];
-        snprintf(msg, sizeof(msg), "plugin_manager_deinit: clearing interval slot %d before", i);
-        deinit_diag(msg);
-        luaL_unref(plugin_intervals[i].L, LUA_REGISTRYINDEX, plugin_intervals[i].ref);
-        plugin_intervals[i].active = false;
-        plugin_intervals[i].L = NULL;
-        gui_plugin_clear_interval(i);
+    volume = new_volume;
+    volume_gain = (new_volume <= 0.0f) ? 0.0f : 1.0f;
+#ifndef HOST_BUILD
+    int raw = compute_hw_raw(new_volume);
+    audio_output_request_hw_volume_raw(raw, raw);
+    if (audio_output_is_usb_active()) {
+        volume_gain = (new_volume <= 0.0f) ? 0.0f : (float) pow(10.0, calibrated_taper_db((double) new_volume) / 20.0);
     }
+#endif
+    pthread_mutex_unlock(&audio_mutex);
+}
 
-    deinit_diag("plugin_manager_deinit: text_input_cancelled before");
-    plugin_manager_text_input_cancelled();
+void audio_set_volume(float new_volume) {
+    unsigned int generation = atomic_fetch_add(&volume_set_generation, 1) + 1;
+    audio_apply_volume(new_volume, generation);
+}
 
-    for (int i = 0; i < plugin_instance_count; i++) {
-        if (plugin_instances[i].L) {
-            char msg[160];
-            snprintf(msg, sizeof(msg), "plugin_manager_deinit: lua_close slot %d id='%s' name='%s' before", i,
-                     plugin_instances[i].id, plugin_instances[i].name);
-            deinit_diag(msg);
-            lua_close(plugin_instances[i].L);
-        }
+void audio_stage_custom_hw_volume_curve(bool active, const uint8_t * curve) {
+    pthread_mutex_lock(&audio_mutex);
+    staged_hw_curve_active = active;
+    if (active) memcpy(staged_hw_curve, curve, sizeof(staged_hw_curve));
+    pthread_mutex_unlock(&audio_mutex);
+}
+
+void audio_get_staged_hw_volume_curve_state(bool * active_out, uint8_t * curve_out) {
+    pthread_mutex_lock(&audio_mutex);
+    *active_out = staged_hw_curve_active;
+    memcpy(curve_out, staged_hw_curve, sizeof(staged_hw_curve));
+    pthread_mutex_unlock(&audio_mutex);
+}
+
+/* Installs staged as the new live state and writes hardware once to
+ * match, both under the same lock -- see this function's own doc comment
+ * in audio.h for why the install and the write must be atomic together,
+ * not two separate locked steps. */
+void audio_commit_hw_volume_curve(void) {
+    pthread_mutex_lock(&audio_mutex);
+    custom_hw_curve_active = staged_hw_curve_active;
+    if (staged_hw_curve_active) memcpy(custom_hw_curve, staged_hw_curve, sizeof(custom_hw_curve));
+#ifndef HOST_BUILD
+    int raw = compute_hw_raw(volume);
+    audio_output_request_hw_volume_raw(raw, raw);
+#endif
+    pthread_mutex_unlock(&audio_mutex);
+}
+
+/* Reapplies immediately at whatever volume is currently authoritative, so
+ * a curve switch is audible right away rather than waiting for the next
+ * slider touch -- for the normal "an already-loaded, running plugin
+ * changes its curve" case only, see this function's own doc comment in
+ * audio.h. Mutates the LIVE pair directly, under one lock alongside the
+ * write -- NOT via audio_stage_custom_hw_volume_curve()/
+ * audio_commit_hw_volume_curve(), which operate on the separate STAGED
+ * pair a plugin (re)load transaction uses; this path runs outside any
+ * such transaction; touching STAGED here would leave it holding a value
+ * that doesn't belong to (and could leak into) whatever transaction
+ * starts next. Deliberately NOT implemented via audio_set_volume():
+ * that bumps volume_set_generation as a brand-new synchronous command,
+ * which would silently invalidate a newer audio_request_volume() (an
+ * in-flight slider-drag sample) already queued on the worker thread by
+ * the time it runs -- this only ever touches the hardware register, not
+ * that generation counter. */
+void audio_set_custom_hw_volume_curve(const uint8_t * curve) {
+    pthread_mutex_lock(&audio_mutex);
+    custom_hw_curve_active = (curve != NULL);
+    if (curve) memcpy(custom_hw_curve, curve, sizeof(custom_hw_curve));
+#ifndef HOST_BUILD
+    int raw = compute_hw_raw(volume);
+    audio_output_request_hw_volume_raw(raw, raw);
+#endif
+    pthread_mutex_unlock(&audio_mutex);
+}
+
+static void * volume_request_worker_main(void * unused) {
+    (void) unused;
+    for (;;) {
+        pthread_mutex_lock(&volume_request_mutex);
+        while (!volume_request_pending)
+            pthread_cond_wait(&volume_request_cond, &volume_request_mutex);
+        float requested = volume_requested_value;
+        unsigned int generation = volume_requested_generation;
+        volume_request_pending = false;
+        pthread_mutex_unlock(&volume_request_mutex);
+        audio_apply_volume(requested, generation);
     }
-    deinit_diag("plugin_manager_deinit: all lua_close done, memset before");
-    memset(plugin_instances, 0, sizeof(plugin_instances));
-    plugin_instance_count = 0;
-
-    memset(plugin_books_list_items, 0, sizeof(plugin_books_list_items));
-    plugin_books_list_item_count = 0;
-    memset(plugin_settings_list_items, 0, sizeof(plugin_settings_list_items));
-    plugin_settings_list_item_count = 0;
-    memset(plugin_display_list_items, 0, sizeof(plugin_display_list_items));
-    plugin_display_list_item_count = 0;
-    memset(plugin_playback_list_items, 0, sizeof(plugin_playback_list_items));
-    plugin_playback_list_item_count = 0;
-    memset(plugin_power_list_items, 0, sizeof(plugin_power_list_items));
-    plugin_power_list_item_count = 0;
-    memset(plugin_system_list_items, 0, sizeof(plugin_system_list_items));
-    plugin_system_list_item_count = 0;
-    memset(plugin_stream_tiles, 0, sizeof(plugin_stream_tiles));
-    plugin_stream_tile_count = 0;
-    memset(plugin_home_tiles, 0, sizeof(plugin_home_tiles));
-    plugin_home_tile_count = 0;
-    memset(plugin_list_callbacks, 0, sizeof(plugin_list_callbacks));
-    memset(plugin_settings_list_rows, 0, sizeof(plugin_settings_list_rows));
-    memset(plugin_settings_list_row_counts, 0, sizeof(plugin_settings_list_row_counts));
-    memset(plugin_event_subscriber_count, 0, sizeof(plugin_event_subscriber_count));
+    return NULL;
 }
 
-void plugin_manager_poll(void) {
-    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++) {
-        plugin_async_http_t * req = &plugin_async_http[i];
-        if (!req->active || !atomic_load(&req->done)) continue;
-        pthread_join(req->thread, NULL);
-
-        if (!http_cancel_token_is_cancelled(&req->cancel)) {
-            lua_rawgeti(req->L, LUA_REGISTRYINDEX, req->callback_ref);
-            int callback_args;
-            if (req->is_download) {
-                if (req->ok) {
-                    lua_pushstring(req->L, req->dest_path);
-                    lua_pushnil(req->L);
-                } else {
-                    lua_pushnil(req->L);
-                    lua_pushstring(req->L, "download failed");
-                }
-                callback_args = 2;
-            } else if (req->ok) {
-                lua_pushinteger(req->L, req->status);
-                lua_pushlstring(req->L, req->response_body ? (const char *) req->response_body : "",
-                                req->response_body_size);
-                lua_pushnil(req->L);
-                lua_newtable(req->L);
-                for (int h = 0; h < req->response_header_count; h++) {
-                    lua_pushstring(req->L, req->response_headers[h].value);
-                    lua_setfield(req->L, -2, req->response_headers[h].name);
-                }
-                callback_args = 4;
-            } else {
-                lua_pushnil(req->L);
-                lua_pushnil(req->L);
-                lua_pushstring(req->L, (req->response_error && req->response_error[0])
-                                           ? req->response_error : "network error or response limit exceeded");
-                callback_args = 3;
-            }
-            if (plugin_call(req->L, callback_args, 0, 0) != LUA_OK) {
-                const char * err = lua_tostring(req->L, -1);
-                fprintf(stderr, "[plugins] HTTP callback error: %s\n", err ? err : "unknown error");
-                lua_pop(req->L, 1);
-            }
-        }
-
-        luaL_unref(req->L, LUA_REGISTRYINDEX, req->callback_ref);
-        free(req->response_body);
-        req->response_body = NULL;
-        req->response_body_size = 0;
-        req->active = false;
-        atomic_store(&req->done, false);
-        http_cancel_token_destroy(&req->cancel);
-        req->L = NULL;
-        req->callback_ref = LUA_NOREF;
-    }
-}
-
-bool plugin_manager_has_background_work(void) {
-    for (int i = 0; i < PLUGIN_MAX_ASYNC_HTTP; i++)
-        if (plugin_async_http[i].active) return true;
-    return false;
-}
-
-static void dispatch_list_item_open(plugin_list_item_t * item, const char * kind) {
-    lua_rawgeti(item->L, LUA_REGISTRYINDEX, item->open_ref);
-    if (plugin_call(item->L, 0, 0, 0) != LUA_OK) {
-        const char * err = lua_tostring(item->L, -1);
-        fprintf(stderr, "[plugins] %s '%s' on_open error: %s\n", kind, item->label, err ? err : "unknown error");
-        lua_pop(item->L, 1);
-    }
-}
-
-static void get_list_item_options(const plugin_list_item_t * array, int count, int index, const char ** out_icon,
-                                   int32_t * out_height, int32_t * out_width, const char ** out_text_size) {
-    *out_icon = NULL;
-    *out_height = 0;
-    *out_width = 0;
-    *out_text_size = NULL;
-    if (index < 0 || index >= count) return;
-
-    const plugin_list_item_t * item = &array[index];
-    if (item->icon_path[0]) *out_icon = item->icon_path;
-    *out_height = item->row_height;
-    *out_width = item->row_width;
-    if (item->text_size[0]) *out_text_size = item->text_size;
-}
-
-int plugin_manager_get_books_list_item_count(void) {
-    return plugin_books_list_item_count;
-}
-
-const char * plugin_manager_get_books_list_item_label(int index) {
-    if (index < 0 || index >= plugin_books_list_item_count) return "";
-    return plugin_books_list_items[index].label;
-}
-
-void plugin_manager_books_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_books_list_item_count) return;
-    dispatch_list_item_open(&plugin_books_list_items[index], "books list item");
-}
-
-void plugin_manager_get_books_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                 int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_books_list_items, plugin_books_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
-
-int plugin_manager_get_settings_list_item_count(void) {
-    return plugin_settings_list_item_count;
-}
-
-const char * plugin_manager_get_settings_list_item_label(int index) {
-    if (index < 0 || index >= plugin_settings_list_item_count) return "";
-    return plugin_settings_list_items[index].label;
-}
-
-void plugin_manager_settings_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_settings_list_item_count) return;
-    dispatch_list_item_open(&plugin_settings_list_items[index], "settings list item");
-}
-
-void plugin_manager_get_settings_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                    int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_settings_list_items, plugin_settings_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
-
-int plugin_manager_get_display_list_item_count(void) {
-    return plugin_display_list_item_count;
-}
-
-const char * plugin_manager_get_display_list_item_label(int index) {
-    if (index < 0 || index >= plugin_display_list_item_count) return "";
-    return plugin_display_list_items[index].label;
-}
-
-void plugin_manager_display_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_display_list_item_count) return;
-    dispatch_list_item_open(&plugin_display_list_items[index], "display list item");
-}
-
-void plugin_manager_get_display_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                   int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_display_list_items, plugin_display_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
-
-int plugin_manager_get_playback_list_item_count(void) {
-    return plugin_playback_list_item_count;
-}
-
-const char * plugin_manager_get_playback_list_item_label(int index) {
-    if (index < 0 || index >= plugin_playback_list_item_count) return "";
-    return plugin_playback_list_items[index].label;
-}
-
-void plugin_manager_playback_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_playback_list_item_count) return;
-    dispatch_list_item_open(&plugin_playback_list_items[index], "playback list item");
-}
-
-void plugin_manager_get_playback_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                    int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_playback_list_items, plugin_playback_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
-
-int plugin_manager_get_power_list_item_count(void) {
-    return plugin_power_list_item_count;
-}
-
-const char * plugin_manager_get_power_list_item_label(int index) {
-    if (index < 0 || index >= plugin_power_list_item_count) return "";
-    return plugin_power_list_items[index].label;
-}
-
-void plugin_manager_power_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_power_list_item_count) return;
-    dispatch_list_item_open(&plugin_power_list_items[index], "power list item");
-}
-
-void plugin_manager_get_power_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                 int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_power_list_items, plugin_power_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
-
-int plugin_manager_get_system_list_item_count(void) {
-    return plugin_system_list_item_count;
-}
-
-const char * plugin_manager_get_system_list_item_label(int index) {
-    if (index < 0 || index >= plugin_system_list_item_count) return "";
-    return plugin_system_list_items[index].label;
-}
-
-void plugin_manager_system_list_item_clicked(int index) {
-    if (index < 0 || index >= plugin_system_list_item_count) return;
-    dispatch_list_item_open(&plugin_system_list_items[index], "system list item");
-}
-
-void plugin_manager_get_system_list_item_options(int index, const char ** out_icon, int32_t * out_height,
-                                                  int32_t * out_width, const char ** out_text_size) {
-    get_list_item_options(plugin_system_list_items, plugin_system_list_item_count, index, out_icon, out_height,
-                           out_width, out_text_size);
-}
-
-static void dispatch_tile_open(plugin_tile_t * t) {
-    lua_rawgeti(t->L, LUA_REGISTRYINDEX, t->open_ref);
-    if (plugin_call(t->L, 0, 0, 0) != LUA_OK) {
-        const char * err = lua_tostring(t->L, -1);
-        fprintf(stderr, "[plugins] tile '%s' on_open error: %s\n", t->label, err ? err : "unknown error");
-        lua_pop(t->L, 1);
-    }
-}
-
-int plugin_manager_get_stream_tile_count(void) {
-    return plugin_stream_tile_count;
-}
-
-const char * plugin_manager_get_stream_tile_label(int index) {
-    if (index < 0 || index >= plugin_stream_tile_count) return "";
-    return plugin_stream_tiles[index].label;
-}
-
-const char * plugin_manager_get_stream_tile_icon(int index) {
-    if (index < 0 || index >= plugin_stream_tile_count) return "stream_media/radio.png";
-    return plugin_stream_tiles[index].icon;
-}
-
-const char * plugin_manager_get_stream_tile_icon_selected(int index) {
-    if (index < 0 || index >= plugin_stream_tile_count) return "stream_media/radio_s.png";
-    return plugin_stream_tiles[index].icon_selected;
-}
-
-void plugin_manager_stream_tile_clicked(int index) {
-    if (index < 0 || index >= plugin_stream_tile_count) return;
-    dispatch_tile_open(&plugin_stream_tiles[index]);
-}
-
-int plugin_manager_get_home_tile_count(void) {
-    return plugin_home_tile_count;
-}
-
-int plugin_manager_find_home_tile_by_id(const char * id) {
-    if (!id) return -1;
-    for (int i = 0; i < plugin_home_tile_count; i++) {
-        if (strcmp(plugin_home_tiles[i].id, id) == 0) return i;
-    }
-    return -1;
-}
-
-const char * plugin_manager_get_home_tile_id(int index) {
-    if (index < 0 || index >= plugin_home_tile_count) return "";
-    return plugin_home_tiles[index].id;
-}
-
-const char * plugin_manager_get_home_tile_label(int index) {
-    if (index < 0 || index >= plugin_home_tile_count) return "";
-    return plugin_home_tiles[index].label;
-}
-
-const char * plugin_manager_get_home_tile_icon(int index) {
-    if (index < 0 || index >= plugin_home_tile_count) return "";
-    return plugin_home_tiles[index].icon;
-}
-
-const char * plugin_manager_get_home_tile_icon_selected(int index) {
-    if (index < 0 || index >= plugin_home_tile_count) return "";
-    return plugin_home_tiles[index].icon_selected;
-}
-
-void plugin_manager_home_tile_clicked(int index) {
-    if (index < 0 || index >= plugin_home_tile_count) return;
-    dispatch_tile_open(&plugin_home_tiles[index]);
-}
-
-void plugin_manager_list_item_selected(int slot, int index) {
-    if (slot < 0 || slot >= PLUGIN_LIST_SCREEN_POOL_SIZE) return;
-    plugin_list_callback_t * cb = &plugin_list_callbacks[slot];
-    if (!cb->L || cb->select_ref == LUA_NOREF) return;
-
-    lua_rawgeti(cb->L, LUA_REGISTRYINDEX, cb->select_ref);
-    lua_pushinteger(cb->L, index + 1);
-    if (plugin_call(cb->L, 1, 0, 0) != LUA_OK) {
-        const char * err = lua_tostring(cb->L, -1);
-        fprintf(stderr, "[plugins] show_list on_select error: %s\n", err ? err : "unknown error");
-        lua_pop(cb->L, 1);
+static void start_volume_request_worker(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, volume_request_worker_main, NULL) == 0) {
+        pthread_detach(thread);
+        volume_request_worker_ready = true;
     }
 }
 
-static bool settings_list_row_ref(int slot, int row, lua_State ** out_L, int * out_ref) {
-    if (slot < 0 || slot >= PLUGIN_SETTINGS_LIST_SCREEN_POOL_SIZE) return false;
-    if (row < 0 || row >= plugin_settings_list_row_counts[slot]) return false;
-    plugin_settings_list_row_ref_t * r = &plugin_settings_list_rows[slot][row];
-    if (!r->L) return false;
-    *out_L = r->L;
-    *out_ref = r->callback_ref;
-    return true;
-}
-
-void plugin_manager_settings_list_row_selected(int slot, int row) {
-    lua_State * L;
-    int ref;
-    if (!settings_list_row_ref(slot, row, &L, &ref)) return;
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-    if (plugin_call(L, 0, 0, 0) != LUA_OK) {
-        const char * err = lua_tostring(L, -1);
-        fprintf(stderr, "[plugins] show_settings_list on_select error: %s\n", err ? err : "unknown error");
-        lua_pop(L, 1);
+void audio_request_volume(float new_volume) {
+    if (new_volume < 0.0f) new_volume = 0.0f;
+    if (new_volume > 1.0f) new_volume = 1.0f;
+    unsigned int generation = atomic_fetch_add(&volume_set_generation, 1) + 1;
+    pthread_once(&volume_request_once, start_volume_request_worker);
+    if (!volume_request_worker_ready) {
+        audio_apply_volume(new_volume, generation);
+        return;
     }
+    pthread_mutex_lock(&volume_request_mutex);
+    volume_requested_value = new_volume;
+    volume_requested_generation = generation;
+    volume_request_pending = true;
+    pthread_cond_signal(&volume_request_cond);
+    pthread_mutex_unlock(&volume_request_mutex);
 }
 
-void plugin_manager_settings_list_toggled(int slot, int row, bool new_value) {
-    lua_State * L;
-    int ref;
-    if (!settings_list_row_ref(slot, row, &L, &ref)) return;
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-    lua_pushboolean(L, new_value);
-    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
-        const char * err = lua_tostring(L, -1);
-        fprintf(stderr, "[plugins] show_settings_list on_change error: %s\n", err ? err : "unknown error");
-        lua_pop(L, 1);
-    }
+float audio_get_volume(void) {
+    pthread_mutex_lock(&audio_mutex);
+    float result = volume;
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
 }
 
-void plugin_manager_settings_list_slid(int slot, int row, int new_value) {
-    lua_State * L;
-    int ref;
-    if (!settings_list_row_ref(slot, row, &L, &ref)) return;
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-    lua_pushinteger(L, new_value);
-    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
-        const char * err = lua_tostring(L, -1);
-        fprintf(stderr, "[plugins] show_settings_list on_change error: %s\n", err ? err : "unknown error");
-        lua_pop(L, 1);
-    }
+bool audio_consume_track_finished(void) {
+    pthread_mutex_lock(&audio_mutex);
+    bool result = track_finished;
+    track_finished = false;
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
 }
 
-void plugin_manager_notify_track_started(const char * title, const char * artist, const char * album,
-                                          double duration_seconds, const char * provider, const char * track_id) {
-    for (int i = 0; i < plugin_event_subscriber_count[PLUGIN_EVENT_TRACK_STARTED]; i++) {
-        plugin_event_subscriber_t * sub = &plugin_event_subscribers[PLUGIN_EVENT_TRACK_STARTED][i];
-        lua_rawgeti(sub->L, LUA_REGISTRYINDEX, sub->ref);
-        lua_pushstring(sub->L, title ? title : "");
-        lua_pushstring(sub->L, artist ? artist : "");
-        lua_pushstring(sub->L, album ? album : "");
-        lua_pushnumber(sub->L, duration_seconds);
-        lua_pushstring(sub->L, provider ? provider : "");
-        lua_pushstring(sub->L, track_id ? track_id : "");
-        if (plugin_call(sub->L, 6, 0, 0) != LUA_OK) {
-            const char * err = lua_tostring(sub->L, -1);
-            fprintf(stderr, "[plugins] track_started handler error: %s\n", err ? err : "unknown error");
-            lua_pop(sub->L, 1);
-        }
-    }
+bool audio_consume_track_advanced(void) {
+    pthread_mutex_lock(&audio_mutex);
+    bool result = track_advanced;
+    track_advanced = false;
+    pthread_mutex_unlock(&audio_mutex);
+    return result;
 }
 
-static void notify_event_no_args(plugin_event_t idx, const char * kind) {
-    for (int i = 0; i < plugin_event_subscriber_count[idx]; i++) {
-        plugin_event_subscriber_t * sub = &plugin_event_subscribers[idx][i];
-        lua_rawgeti(sub->L, LUA_REGISTRYINDEX, sub->ref);
-        if (plugin_call(sub->L, 0, 0, 0) != LUA_OK) {
-            const char * err = lua_tostring(sub->L, -1);
-            fprintf(stderr, "[plugins] %s handler error: %s\n", kind, err ? err : "unknown error");
-            lua_pop(sub->L, 1);
-        }
-    }
+audio_error_t audio_consume_error_ex(uint64_t * out_generation) {
+    pthread_mutex_lock(&audio_mutex);
+    audio_error_t err = last_playback_error;
+    if (out_generation) *out_generation = last_playback_error_generation;
+    last_playback_error = AUDIO_ERROR_NONE;
+    last_playback_error_generation = 0;
+    pthread_mutex_unlock(&audio_mutex);
+    return err;
 }
 
-void plugin_manager_notify_paused(void) {
-    notify_event_no_args(PLUGIN_EVENT_PAUSED, "paused");
+audio_error_t audio_consume_error(void) {
+    return audio_consume_error_ex(NULL);
 }
 
-void plugin_manager_notify_resumed(void) {
-    notify_event_no_args(PLUGIN_EVENT_RESUMED, "resumed");
+uint64_t audio_get_playback_generation(void) {
+    pthread_mutex_lock(&audio_mutex);
+    uint64_t gen = playback_generation;
+    pthread_mutex_unlock(&audio_mutex);
+    return gen;
 }
-
-void plugin_manager_notify_stopped(void) {
-    notify_event_no_args(PLUGIN_EVENT_STOPPED, "stopped");
-}
-
-void plugin_manager_notify_screen_woke(void) {
-    notify_event_no_args(PLUGIN_EVENT_SCREEN_WOKE, "screen_woke");
-}
-
-void plugin_manager_interval_fired(int slot) {
-    if (slot < 0 || slot >= PLUGIN_MAX_INTERVALS || !plugin_intervals[slot].active) return;
-
-    lua_State * L = plugin_intervals[slot].L;
-    lua_rawgeti(L, LUA_REGISTRYINDEX, plugin_intervals[slot].ref);
-    if (plugin_call(L, 0, 0, 0) != LUA_OK) {
-        const char * err = lua_tostring(L, -1);
-        fprintf(stderr, "[plugins] set_interval callback error: %s\n", err ? err : "unknown error");
-        lua_pop(L, 1);
-    }
-}
-
-void plugin_manager_text_input_submitted(const char * text) {
-    if (!pending_text_input_L || pending_text_input_ref == LUA_NOREF) return;
-
-    lua_State * L = pending_text_input_L;
-    int ref = pending_text_input_ref;
-    pending_text_input_L = NULL;
-    pending_text_input_ref = LUA_NOREF;
-
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-    lua_pushstring(L, text ? text : "");
-    if (plugin_call(L, 1, 0, 0) != LUA_OK) {
-        const char * err = lua_tostring(L, -1);
-        fprintf(stderr, "[plugins] show_text_input on_submit error: %s\n", err ? err : "unknown error");
-        lua_pop(L, 1);
-    }
-    luaL_unref(L, LUA_REGISTRYINDEX, ref);
-}
-
-void plugin_manager_text_input_cancelled(void) {
-    if (!pending_text_input_L || pending_text_input_ref == LUA_NOREF) return;
-    luaL_unref(pending_text_input_L, LUA_REGISTRYINDEX, pending_text_input_ref);
-    pending_text_input_L = NULL;
-    pending_text_input_ref = LUA_NOREF;
-}
-EOF
