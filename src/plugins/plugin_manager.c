@@ -1,9 +1,8 @@
 #include "plugin_manager.h"
 #include "gui.h"
 #include "gui_reload.h"
-#include "gui_lock_screen.h"
-#include "peq.h"
 #include "audio.h"
+#include "peq.h"
 #include "http_client.h"
 #include "playlist_files.h"
 #include "plugin_json.h"
@@ -2003,74 +2002,32 @@ static int l_plugin_eq_set_band_enabled(lua_State * L) {
     return 0;
 }
 
-/* Same "pure audio-domain, straight into audio.c, no gui.c bridge" shape as
- * plugin.eq_*() above -- setting a hardware volume curve isn't paired with
- * any gui.c-local UI state (it doesn't move the volume slider or its
- * popup, it changes what a given slider position maps to internally), so
- * it doesn't need one. In-process only, like every other plugin config
- * call in this file -- not persisted, a plugin re-applies it at the top of
- * its own script on every boot (same convention set_home_layout() etc.
- * already use, see their own comments). HW_VOLUME_CURVE_LEN is audio.h's
- * own shared definition, not a local one, so this validation can't drift
- * out of sync with audio_set_custom_hw_volume_curve()'s actual buffer
- * size.
+/* plugin.set_gain(mode) / get_gain() -- maps the stock R1 HDB/LDB hardware
+ * volume curves into the open player's local CS43131 volume control.
  *
- * loading_plugin_slot >= 0 for exactly the duration of a plugin's own
- * top-level script run (set/cleared around plugin_call() in
- * load_plugin_file(), never true from a later callback -- a real Gain
- * Mode plugin's Settings-list on_select handler, for instance, always
- * runs with it back at -1). Inside that window this call is part of
- * plugin_manager_init()'s own load transaction (which may still load more
- * plugin files, or discard this very one if it fails on a later call),
- * so it only stages the state change -- audio_stage_custom_hw_volume_
- * curve(), no hardware write, and no effect on the live state
- * audio_apply_volume() reads -- and load_plugin_file()/plugin_manager_
- * init() own the single deferred commit (see audio.h's own comment on
- * why an immediate write per call here would risk an intermediate value
- * actually reaching the DAC, or surviving a later failure). Outside that
- * window -- a live, already-loaded plugin changing its own curve --
- * audio_set_custom_hw_volume_curve() applies it immediately instead, for
- * real-time audible feedback. */
-static int l_plugin_set_hw_volume_curve(lua_State * L) {
-    bool during_load = loading_plugin_slot >= 0;
-
-    if (lua_isnoneornil(L, 1)) {
-        if (during_load) audio_stage_custom_hw_volume_curve(false, NULL);
-        else audio_set_custom_hw_volume_curve(NULL);
-        return 0;
+ * "low" uses the stock LDB table, "high" uses the stock HDB table. The
+ * default mode is intentionally not exposed to Lua: it preserves this
+ * project's existing calibrated taper until the user explicitly chooses a
+ * gain profile. */
+static int l_plugin_set_gain(lua_State * L) {
+    const char * mode = luaL_checkstring(L, 1);
+    if (strcmp(mode, "low") == 0) {
+        audio_set_gain_mode(AUDIO_GAIN_LOW);
+    } else if (strcmp(mode, "high") == 0) {
+        audio_set_gain_mode(AUDIO_GAIN_HIGH);
+    } else {
+        return luaL_error(L, "plugin.set_gain: expected \"low\" or \"high\"");
     }
-    luaL_checktype(L, 1, LUA_TTABLE);
-    lua_Unsigned raw_n = lua_rawlen(L, 1);
-    if (raw_n != HW_VOLUME_CURVE_LEN)
-        return luaL_error(L, "plugin.set_hw_volume_curve: table must have exactly %d entries (UI volume 0..100), got %d",
-                           HW_VOLUME_CURVE_LEN, (int) raw_n);
-
-    uint8_t curve[HW_VOLUME_CURVE_LEN];
-    for (int i = 0; i < HW_VOLUME_CURVE_LEN; i++) {
-        lua_rawgeti(L, 1, i + 1);
-        /* lua_tointeger() alone silently converts a missing/nonnumeric/
-         * non-integral entry to 0 -- and raw 0 is the hardware's LOUDEST
-         * point (see compute_hw_raw()'s own comment in audio.c), so a
-         * malformed table (a hole, a string, a float like 128.5) could
-         * otherwise turn into an unexpected full-volume step instead of a
-         * caught error. lua_isinteger() rejects all of those before any
-         * conversion happens. */
-        if (!lua_isinteger(L, -1)) {
-            int t = lua_type(L, -1);
-            lua_pop(L, 1);
-            return luaL_error(L, "plugin.set_hw_volume_curve: table[%d] (UI volume %d%%) is not an integer (got %s)",
-                               i + 1, i, lua_typename(L, t));
-        }
-        lua_Integer v = lua_tointeger(L, -1);
-        lua_pop(L, 1);
-        if (v < 0 || v > 255)
-            return luaL_error(L, "plugin.set_hw_volume_curve: table[%d] (UI volume %d%%) is %lld, must be 0..255",
-                               i + 1, i, (long long) v);
-        curve[i] = (uint8_t) v;
-    }
-    if (during_load) audio_stage_custom_hw_volume_curve(true, curve);
-    else audio_set_custom_hw_volume_curve(curve);
     return 0;
+}
+
+static int l_plugin_get_gain(lua_State * L) {
+    switch (audio_get_gain_mode()) {
+        case AUDIO_GAIN_LOW: lua_pushstring(L, "low"); break;
+        case AUDIO_GAIN_HIGH: lua_pushstring(L, "high"); break;
+        default: lua_pushnil(L); break;
+    }
+    return 1;
 }
 
 /* ---- plugin.toggle_pause()/stop()/next_track()/prev_track()/seek()/
@@ -3121,7 +3078,6 @@ typedef enum {
     PLUGIN_EVENT_PAUSED,
     PLUGIN_EVENT_RESUMED,
     PLUGIN_EVENT_STOPPED,
-    PLUGIN_EVENT_SCREEN_WOKE,
     PLUGIN_EVENT_COUNT,
 } plugin_event_t;
 
@@ -3142,8 +3098,7 @@ static int l_plugin_on(lua_State * L) {
     else if (strcmp(event, "paused") == 0) idx = PLUGIN_EVENT_PAUSED;
     else if (strcmp(event, "resumed") == 0) idx = PLUGIN_EVENT_RESUMED;
     else if (strcmp(event, "stopped") == 0) idx = PLUGIN_EVENT_STOPPED;
-    else if (strcmp(event, "screen_woke") == 0) idx = PLUGIN_EVENT_SCREEN_WOKE;
-    else return luaL_error(L, "plugin.on: unknown event '%s' (expected \"track_started\", \"paused\", \"resumed\", \"stopped\", or \"screen_woke\")", event);
+    else return luaL_error(L, "plugin.on: unknown event '%s' (expected \"track_started\", \"paused\", \"resumed\", or \"stopped\")", event);
 
     if (plugin_event_subscriber_count[idx] >= PLUGIN_MAX_EVENT_SUBSCRIBERS) {
         return luaL_error(L, "plugin.on: too many subscribers registered for \"%s\" (max %d)", event,
@@ -3207,85 +3162,6 @@ static int l_plugin_clear_interval(lua_State * L) {
     plugin_intervals[slot].L = NULL;
     gui_plugin_clear_interval(slot);
     return 0;
-}
-
-static int l_plugin_show_lock_screen(lua_State * L) {
-    if (!lua_istable(L, 1)) {
-        lua_pushboolean(L, false);
-        lua_pushliteral(L, "options must be a table");
-        return 2;
-    }
-
-    lua_getfield(L, 1, "mode");
-    const char * mode_str = lua_tostring(L, -1);
-    gui_lock_screen_options_t opts;
-    memset(&opts, 0, sizeof(opts));
-
-    if (!mode_str) {
-        lua_pop(L, 1);
-        lua_pushboolean(L, false);
-        lua_pushliteral(L, "missing mode");
-        return 2;
-    }
-
-    if (strcmp(mode_str, "album_art") == 0) {
-        opts.mode = LOCK_SCREEN_MODE_ALBUM_ART;
-    } else if (strcmp(mode_str, "image") == 0) {
-        opts.mode = LOCK_SCREEN_MODE_IMAGE;
-    } else if (strcmp(mode_str, "clock") == 0) {
-        opts.mode = LOCK_SCREEN_MODE_CLOCK;
-    } else {
-        lua_pop(L, 1);
-        lua_pushboolean(L, false);
-        lua_pushliteral(L, "invalid mode (expected 'album_art', 'image', or 'clock')");
-        return 2;
-    }
-    lua_pop(L, 1);
-
-    if (opts.mode == LOCK_SCREEN_MODE_IMAGE) {
-        lua_getfield(L, 1, "image_path");
-        const char * path = lua_tostring(L, -1);
-        /* Checked BEFORE access() -- access() validates whatever the caller
-         * actually passed, but the real copy below is bounded to
-         * sizeof(opts.image_path); without this check a path >= that size
-         * would pass access() against the real file and then get silently
-         * truncated by snprintf() into a different (or nonexistent) path,
-         * while this function still reports success to Lua. */
-        if (!path || strlen(path) >= sizeof(opts.image_path)) {
-            lua_pop(L, 1);
-            lua_pushboolean(L, false);
-            lua_pushliteral(L, "image_path missing or too long");
-            return 2;
-        }
-        if (access(path, R_OK) != 0) {
-            lua_pop(L, 1);
-            lua_pushboolean(L, false);
-            lua_pushliteral(L, "image_path inaccessible or not readable");
-            return 2;
-        }
-        snprintf(opts.image_path, sizeof(opts.image_path), "%s", path);
-        lua_pop(L, 1);
-    }
-
-    lua_getfield(L, 1, "clock_24h");
-    if (lua_isboolean(L, -1)) {
-        opts.clock_24h = lua_toboolean(L, -1);
-    } else {
-        /* No explicit override -- match the device's own 12/24-hour Display
-         * setting rather than silently forcing 24-hour, so the lock screen's
-         * clock doesn't visibly disagree with the status bar/Settings
-         * screen. */
-        opts.clock_24h = current_settings.clock_24h;
-    }
-    lua_pop(L, 1);
-
-    bool ok = gui_lock_screen_show(&opts);
-    lua_pushboolean(L, ok);
-    if (!ok) {
-        lua_pushliteral(L, "failed to show lock screen");
-        return 2;
-    }
-    return 1;
 }
 
 static bool plugin_id_is_valid(const char * id) {
@@ -3367,7 +3243,7 @@ static const char * const plugin_capabilities[] = {
     "network.http.download", "filesystem.mkdir", "crypto.md5", "audio.peq", "data.json",
     "storage.namespaced", "storage.secrets", "playback.remote", "filesystem.playlists", "library.refresh",
     "ui.home_layout", "ui.theme_refresh", "ui.reload", "ui.home_tiles", "ui.launcher_layout",
-    "ui.home_background", "audio.hw_volume_curve", "ui.lock_screen"
+    "ui.home_background", "audio.gain"
 };
 
 static int l_plugin_has_capability(lua_State * L) {
@@ -3560,7 +3436,9 @@ static const luaL_Reg plugin_funcs[] = {
     { "play_remote",               l_plugin_play_remote },
     { "queue_remote_list",         l_plugin_queue_remote_list },
     { "show_toast",                l_plugin_show_toast },
-    { "set_icon",                  l_plugin_set_icon },
+    { "set_gain",                   l_plugin_set_gain },
+    { "get_gain",                   l_plugin_get_gain },
+    { "set_icon",                   l_plugin_set_icon },
     { "set_background_color",      l_plugin_set_background_color },
     { "set_text_color",            l_plugin_set_text_color },
     { "set_home_layout",           l_plugin_set_home_layout },
@@ -3575,7 +3453,6 @@ static const luaL_Reg plugin_funcs[] = {
     { "eq_set_band",               l_plugin_eq_set_band },
     { "eq_set_band_type",          l_plugin_eq_set_band_type },
     { "eq_set_band_enabled",       l_plugin_eq_set_band_enabled },
-    { "set_hw_volume_curve",       l_plugin_set_hw_volume_curve },
     { "toggle_pause",              l_plugin_toggle_pause },
     { "stop",                      l_plugin_stop },
     { "next_track",                l_plugin_next_track },
@@ -3612,7 +3489,6 @@ static const luaL_Reg plugin_funcs[] = {
     { "on",                        l_plugin_on },
     { "set_interval",              l_plugin_set_interval },
     { "clear_interval",            l_plugin_clear_interval },
-    { "show_lock_screen",          l_plugin_show_lock_screen },
     { NULL, NULL }
 };
 
@@ -3917,24 +3793,6 @@ static int plugin_call(lua_State * L, int nargs, int nresults, int errfunc) {
     return result;
 }
 
-/* Shared by every load_plugin_file() failure path below -- rolls the
- * hardware-volume-curve transaction back to exactly what was staged
- * before this plugin's own top-level run started (see the snapshot taken
- * at the top of load_plugin_file(), before plugin_call()), then discards
- * the half-loaded instance. A prior version only wired the rollback into
- * the Lua-error failure path, missing the legacy-id-collision refusal
- * entirely -- a real, if narrow (needs a deliberately colliding id), gap
- * in the "every failure rolls back" guarantee this exists to close for
- * good: any new failure path added later only has to call this, not
- * remember to re-duplicate the rollback by hand. */
-static void discard_failed_plugin_load(plugin_instance_t * inst, lua_State * L,
-                                        bool prev_curve_active, const uint8_t * prev_curve) {
-    audio_stage_custom_hw_volume_curve(prev_curve_active, prev_curve_active ? prev_curve : NULL);
-    lua_close(L);
-    memset(inst, 0, sizeof(*inst));
-    loading_plugin_slot = -1;
-}
-
 static void load_plugin_file(const char * path) {
     lua_State * L = luaL_newstate();
     if (!L) return;
@@ -3950,29 +3808,6 @@ static void load_plugin_file(const char * path) {
     sandbox_plugin_lua_state(L);
     register_plugin_api(L);
 
-    /* Review finding: a plugin can call plugin.set_hw_volume_curve()
-     * successfully early in its own top-level run, then fail on a LATER
-     * call in that same run (e.g. hitting register_list_item()'s row
-     * cap) -- the whole lua_State gets discarded below, but without
-     * rolling the curve state back too, whatever it last set (or cleared)
-     * stayed in effect on a plugin now reported as failed to load. A
-     * blind "clear to native" on failure is its own, more subtle bug: if
-     * an EARLIER, successfully-loaded plugin already had its own curve
-     * active before this one started, that curve -- not native -- is
-     * what failure should restore, and a naive clear would wipe out a
-     * still-valid plugin's own state. Snapshotting the exact STAGED state
-     * (audio_get_staged_hw_volume_curve_state(), not the live state --
-     * see audio_stage_custom_hw_volume_curve()'s own comment in audio.h
-     * for why the two must stay separate) right before this plugin's own
-     * top-level run starts, and restoring that exact snapshot (not just
-     * "off") on failure via discard_failed_plugin_load() above, handles
-     * both. Still no hardware write either way -- plugin_manager_init()
-     * commits the real final value exactly once after every plugin has
-     * finished (re)loading. */
-    bool prev_curve_active;
-    uint8_t prev_curve[HW_VOLUME_CURVE_LEN];
-    audio_get_staged_hw_volume_curve_state(&prev_curve_active, prev_curve);
-
     /* luaL_dofile(L, path)'s own expansion, with plugin_call() in place of
      * a bare lua_pcall() -- top-level plugin code runs once here too, on
      * the same UI thread as every other plugin_call() site, so it needs
@@ -3980,7 +3815,9 @@ static void load_plugin_file(const char * path) {
     if ((luaL_loadfile(L, path) || plugin_call(L, 0, LUA_MULTRET, 0)) != LUA_OK) {
         const char * err = lua_tostring(L, -1);
         fprintf(stderr, "[plugins] failed to load %s: %s\n", path, err ? err : "unknown error");
-        discard_failed_plugin_load(inst, L, prev_curve_active, prev_curve);
+        lua_close(L);
+        memset(inst, 0, sizeof(*inst));
+        loading_plugin_slot = -1;
         return;
     }
 
@@ -4017,7 +3854,9 @@ static void load_plugin_file(const char * path) {
             if (plugin_id_collides(inst->id, slot)) {
                 fprintf(stderr, "[plugins] refusing to load %s: generated id '%s' still collides with another plugin's id\n",
                         path, inst->id);
-                discard_failed_plugin_load(inst, L, prev_curve_active, prev_curve);
+                lua_close(L);
+                memset(inst, 0, sizeof(*inst));
+                loading_plugin_slot = -1;
                 return;
             }
         }
@@ -4116,37 +3955,27 @@ void plugin_manager_init(void) {
     char dir_path[600];
     int name_count = 0;
     char (*names)[256] = scan_plugin_dir_sorted_names(dir_path, &name_count);
-    if (names) {
-        /* Filter disabled names out BEFORE the PLUGIN_MAX_FILES cap is
-         * applied, not after -- so disabling a plugin actually frees its
-         * slot for a 17th alphabetical file, rather than silently wasting
-         * a load slot on a file that isn't going to load anyway. */
-        int enabled_count = 0;
-        for (int i = 0; i < name_count; i++) {
-            if (plugin_disabled_list_contains(names[i])) continue;
-            if (enabled_count != i) memcpy(names[enabled_count], names[i], sizeof(names[0]));
-            enabled_count++;
-        }
+    if (!names) return;
 
-        int load_count = (enabled_count > PLUGIN_MAX_FILES) ? PLUGIN_MAX_FILES : enabled_count;
-        for (int i = 0; i < load_count; i++) {
-            if (plugin_instance_count >= PLUGIN_MAX_FILES) break;
-            char full_path[700];
-            snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, names[i]);
-            load_plugin_file(full_path);
-        }
-        free(names);
+    /* Filter disabled names out BEFORE the PLUGIN_MAX_FILES cap is applied,
+     * not after -- so disabling a plugin actually frees its slot for a 17th
+     * alphabetical file, rather than silently wasting a load slot on a file
+     * that isn't going to load anyway. */
+    int enabled_count = 0;
+    for (int i = 0; i < name_count; i++) {
+        if (plugin_disabled_list_contains(names[i])) continue;
+        if (enabled_count != i) memcpy(names[enabled_count], names[i], sizeof(names[0]));
+        enabled_count++;
     }
-    /* Exactly one hardware-volume-curve commit for the whole (re)load pass,
-     * reflecting whichever plugin (if any) called plugin.set_hw_volume_
-     * curve() during loading above, or the built-in taper if none did --
-     * unconditional (even when `names` was NULL/empty) so
-     * plugin_manager_deinit()'s own state-only clear always gets a
-     * matching final write. See audio_commit_hw_volume_curve()'s own
-     * comment in audio.h for why this needs to be a single deferred commit
-     * rather than each plugin.set_hw_volume_curve() call writing hardware
-     * immediately during this specific transaction. */
-    audio_commit_hw_volume_curve();
+
+    int load_count = (enabled_count > PLUGIN_MAX_FILES) ? PLUGIN_MAX_FILES : enabled_count;
+    for (int i = 0; i < load_count; i++) {
+        if (plugin_instance_count >= PLUGIN_MAX_FILES) break;
+        char full_path[700];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, names[i]);
+        load_plugin_file(full_path);
+    }
+    free(names);
 }
 
 /* Fills `e` for `filename`, cross-referencing plugin_instances[] for its
@@ -4303,20 +4132,6 @@ void plugin_manager_deinit(void) {
     deinit_diag("plugin_manager_deinit: reset_home_layout before");
     gui_plugin_reset_home_layout();
     gui_plugin_reset_launcher_layout();
-    /* Same "in-process plugin config must not outlive the plugin" category
-     * as the two resets above -- without this, disabling/removing a Gain
-     * Mode-style plugin followed by a UI reload left its hardware volume
-     * curve active indefinitely, with no plugin left running to ever call
-     * plugin.set_hw_volume_curve(nil) itself. Stages the reset (NOT
-     * audio_set_custom_hw_volume_curve(NULL), which would touch the LIVE
-     * state directly and also write to hardware immediately) --
-     * plugin_manager_init() always runs right after this and installs +
-     * commits the real final value exactly once, see its own
-     * audio_commit_hw_volume_curve() call and
-     * audio_stage_custom_hw_volume_curve()'s own comment in audio.h for
-     * why this needs to stay on the separate staged state rather than the
-     * live one a concurrent volume request could still see. */
-    audio_stage_custom_hw_volume_curve(false, NULL);
     deinit_diag("plugin_manager_deinit: cancel_all_async_http before");
     plugin_manager_cancel_all_async_http();
     deinit_diag("plugin_manager_deinit: cancel_all_async_http after");
@@ -4783,10 +4598,6 @@ void plugin_manager_notify_resumed(void) {
 
 void plugin_manager_notify_stopped(void) {
     notify_event_no_args(PLUGIN_EVENT_STOPPED, "stopped");
-}
-
-void plugin_manager_notify_screen_woke(void) {
-    notify_event_no_args(PLUGIN_EVENT_SCREEN_WOKE, "screen_woke");
 }
 
 void plugin_manager_interval_fired(int slot) {
