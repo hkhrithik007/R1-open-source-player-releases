@@ -19,6 +19,13 @@ typedef enum {
     AUDIO_CODEC_VORBIS,
 } audio_codec_t;
 
+/* Audio gain modes for hardware volume control (HDB/LDB curves) */
+typedef enum {
+    AUDIO_GAIN_DEFAULT = 0,
+    AUDIO_GAIN_LOW,
+    AUDIO_GAIN_HIGH,
+} audio_gain_mode_t;
+
 /* Immutable snapshot of the decoder currently feeding playback. The source
  * fields describe the encoded media; the output fields describe what this
  * player actually hands to ALSA/SDL after decoding. source_bit_depth is 0
@@ -266,6 +273,12 @@ void audio_get_staged_hw_volume_curve_state(bool * active_out, uint8_t * curve_o
  * initialized to "inactive", same as live), to call at normal boot for
  * the same reason. */
 void audio_commit_hw_volume_curve(void);
+
+/* Set the audio gain mode (DEFAULT, LOW, HIGH) */
+void audio_set_gain_mode(audio_gain_mode_t mode);
+
+/* Get the current audio gain mode */
+audio_gain_mode_t audio_get_gain_mode(void);
 
 /* Returns true (and clears the flag) exactly once when playback reached a
  * true end-of-playlist -- current track finished with no next track queued
