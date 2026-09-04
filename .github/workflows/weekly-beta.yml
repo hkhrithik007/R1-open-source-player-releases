@@ -181,7 +181,7 @@ jobs:
               release/open_hiby_player \
               release/plugin_examples.zip \
               release/SHA256SUMS \
-              --prerelease \
+              --latest release \
               --target "$GITHUB_SHA" \
               --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
