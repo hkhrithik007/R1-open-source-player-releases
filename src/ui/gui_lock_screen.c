@@ -132,12 +132,12 @@ static void build_lock_screen_if_needed(void) {
     lv_obj_align(lock_image_obj, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
 
-    lock_clock_label = lv_label_create(lock_screen);
-    lv_obj_add_style(lock_clock_label, &style_theme_text_primary, 0);
-    lv_obj_set_style_text_align(lock_clock_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(lock_clock_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
-    lv_obj_align(lock_clock_label, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_add_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
+  lock_clock_label = lv_label_create(lock_screen);
+  lv_obj_add_style(lock_clock_label, &style_theme_text_primary, 0);
+  lv_obj_set_style_text_align(lock_clock_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(lock_clock_label, gui_theme_font(GUI_FONT_ROLE_HEADING), 0);
+  lv_obj_align(lock_clock_label, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_add_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
 }
 
 bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
