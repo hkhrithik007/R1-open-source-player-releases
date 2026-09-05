@@ -95,7 +95,8 @@ static void start_timers(void) {
      * "start if clock" here previously left a stale timer running forever
      * (until the eventual hide/teardown) after switching away from clock
      * mode without an intervening hide(). */
-    if (current_mode == LOCK_SCREEN_MODE_CLOCK) {
+    if (current_mode == LOCK_SCREEN_MODE_CLOCK ||
+        current_mode == LOCK_SCREEN_MODE_IMAGE) {
         if (!lock_clock_timer) {
             lock_clock_timer = lv_timer_create(lock_clock_timer_cb, 1000, NULL);
         }
@@ -174,6 +175,12 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
         snprintf(prefixed_path, sizeof(prefixed_path), "S:%s", options->image_path);
         lv_image_set_src(lock_image_obj, prefixed_path);
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
+
+        /* Custom Image mode also displays the live clock in the center.
+         * lock_clock_label is created after lock_image_obj, so it is rendered
+         * above the image automatically. */
+        update_clock_display();
+        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
     } else if (current_mode == LOCK_SCREEN_MODE_CLOCK) {
         update_clock_display();
         lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
