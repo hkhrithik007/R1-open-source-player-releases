@@ -94,6 +94,7 @@ jobs:
           mkdir -p base
 
           echo "Downloading staging image from upstream repository."
+
           gh release download staging-image-base \
             --pattern r1.upt \
             --dir base \
@@ -225,9 +226,8 @@ jobs:
 
           fi
 
-          echo "Release published successfully:"
-          gh release view "$TAG" \
-            --json name,tagName,isPrerelease,targetCommitish,url
+          echo "Release published successfully: $TAG"
+          echo "Release URL: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
 
       - name: Preserve package as workflow artifact
         uses: actions/upload-artifact@v4
