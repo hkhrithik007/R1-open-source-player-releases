@@ -3247,10 +3247,7 @@ static int l_plugin_show_lock_screen(lua_State * L) {
         const char * path = lua_tostring(L, -1);
         /* Checked BEFORE access() -- access() validates whatever the caller
          * actually passed, but the real copy below is bounded to
-         * sizeof(opts.image_path); without this check a path >= that size
-         * would pass access() against the real file and then get silently
-         * truncated by snprintf() into a different (or nonexistent) path,
-         * while this function still reports success to Lua. */
+         * sizeof(opts.image_path). */
         if (!path || strlen(path) >= sizeof(opts.image_path)) {
             lua_pop(L, 1);
             lua_pushboolean(L, false);
@@ -3271,11 +3268,22 @@ static int l_plugin_show_lock_screen(lua_State * L) {
     if (lua_isboolean(L, -1)) {
         opts.clock_24h = lua_toboolean(L, -1);
     } else {
-        /* No explicit override -- match the device's own 12/24-hour Display
-         * setting rather than silently forcing 24-hour, so the lock screen's
-         * clock doesn't visibly disagree with the status bar/Settings
-         * screen. */
         opts.clock_24h = current_settings.clock_24h;
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "clock_size");
+    if (lua_isinteger(L, -1)) {
+        lua_Integer size = lua_tointeger(L, -1);
+        if (size < 16 || size > 48) {
+            lua_pop(L, 1);
+            lua_pushboolean(L, false);
+            lua_pushliteral(L, "clock_size must be between 16 and 48");
+            return 2;
+        }
+        opts.clock_size = (int) size;
+    } else {
+        opts.clock_size = 28;
     }
     lua_pop(L, 1);
 
@@ -3388,17 +3396,11 @@ static int l_plugin_has_capability(lua_State * L) {
  *   http(s):// stream today (decoder_open()'s is_stream_url() branch --
  *   MP3 default, FLAC via the "#.flac" hint, AAC via "#.aac"/"#.aacp" or
  *   an "audio/aac" Content-Type, ADTS framing via aac_open_stream()).
- * - max_bit_depth is 16 for what this function actually describes: a
- *   plugin-provided REMOTE stream (see decoder_open()'s is_stream_url()
- *   branch this whole comment block is about). audio.c's can_use_wide_path()
- *   explicitly excludes any decoder with a net_stream set, so a plugin's
- *   direct http(s):// stream stays on the s16 decode/output path regardless
- *   of what the source claims -- this is still an accurate, verified fact,
- *   not a stale one. It is NOT true of local file playback any more: local
- *   FLAC/WAV/ALAC/APE/AIFF sources above 16-bit now reach the DAC at
- *   PCM_FORMAT_S24_LE (audio_output.c's open_device()) when hw_params
- *   negotiation for it succeeds. The USB-DAC and Bluetooth aplay spawns are
- *   still unconditionally "-f S16_LE" with no exception, same as before.
+ * - max_bit_depth is 16, not an assumption: every output path (internal
+ *   ALSA in audio_output.c's open_device(), the USB-DAC aplay spawn, and
+ *   the Bluetooth aplay spawn) hardcodes PCM_FORMAT_S16_LE / "-f S16_LE"
+ *   with no exception -- whatever bit depth a source decodes to, this is
+ *   what actually reaches the DAC.
  * - max_channels is 2: nothing in this pipeline remaps or mixes channel
  *   counts; every path above passes `channels` straight through with no
  *   multichannel-aware code found anywhere in the codebase.

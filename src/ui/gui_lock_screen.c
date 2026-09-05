@@ -19,6 +19,7 @@ static lv_timer_t * lock_touch_timer = NULL;
 
 static gui_lock_screen_mode_t current_mode = LOCK_SCREEN_MODE_OFF;
 static bool current_clock_24h = true;
+static int current_clock_size = 28;
 
 /* Swipe-up-to-dismiss tracking -- reuses the same detector already driving
  * the home-indicator swipe gesture elsewhere (gui_shell.c) rather than
@@ -44,6 +45,18 @@ static void update_clock_display(void) {
     char buf[16];
     strftime(buf, sizeof(buf), current_clock_24h ? "%H:%M" : "%I:%M", &tm_info);
     lv_label_set_text(lock_clock_label, buf);
+
+    /* The project has a 28px application font as its largest general UI
+     * font. Use LVGL's object transform to render a plugin-requested clock
+     * size without changing the global font table. 256 = 1.0x. */
+    lv_obj_update_layout(lock_clock_label);
+    int32_t scale = (256 * current_clock_size + 14) / 28;
+    if (scale < 256) scale = 256;
+    lv_obj_set_style_transform_scale(lock_clock_label, scale, 0);
+    lv_obj_set_style_transform_pivot_x(
+        lock_clock_label, lv_obj_get_width(lock_clock_label) / 2, 0);
+    lv_obj_set_style_transform_pivot_y(
+        lock_clock_label, lv_obj_get_height(lock_clock_label) / 2, 0);
 }
 
 static void lock_clock_timer_cb(lv_timer_t * timer) {
@@ -96,7 +109,8 @@ static void start_timers(void) {
      * (until the eventual hide/teardown) after switching away from clock
      * mode without an intervening hide(). */
     if (current_mode == LOCK_SCREEN_MODE_CLOCK ||
-        current_mode == LOCK_SCREEN_MODE_IMAGE) {
+        current_mode == LOCK_SCREEN_MODE_IMAGE ||
+        current_mode == LOCK_SCREEN_MODE_ALBUM_ART) {
         if (!lock_clock_timer) {
             lock_clock_timer = lv_timer_create(lock_clock_timer_cb, 1000, NULL);
         }
@@ -132,12 +146,12 @@ static void build_lock_screen_if_needed(void) {
     lv_obj_align(lock_image_obj, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
 
-  lock_clock_label = lv_label_create(lock_screen);
-  lv_obj_add_style(lock_clock_label, &style_theme_text_primary, 0);
-  lv_obj_set_style_text_align(lock_clock_label, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_font(lock_clock_label, gui_theme_font(GUI_FONT_ROLE_HEADING), 0);
-  lv_obj_align(lock_clock_label, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_add_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
+    lock_clock_label = lv_label_create(lock_screen);
+    lv_obj_add_style(lock_clock_label, &style_theme_text_primary, 0);
+    lv_obj_set_style_text_align(lock_clock_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(lock_clock_label, gui_theme_font(GUI_FONT_ROLE_TITLE), 0);
+    lv_obj_align(lock_clock_label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
 }
 
 bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
@@ -149,6 +163,10 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
 
     current_mode = options->mode;
     current_clock_24h = options->clock_24h;
+    current_clock_size = options->clock_size;
+    if (current_clock_size < 16 || current_clock_size > 48) {
+        current_clock_size = 28;
+    }
 
     /* Reset elements */
     lv_obj_add_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
@@ -162,6 +180,8 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
             lv_image_set_src(lock_image_obj, asset_path("playing_plane/default_cover_565.png"));
         }
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
+        update_clock_display();
+        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
     } else if (current_mode == LOCK_SCREEN_MODE_IMAGE) {
         /* LVGL's lv_fs_get_drv() picks a driver off src[0] -- a plain POSIX
          * path (what plugin.sd_root() and every plugin-supplied path use)
@@ -175,10 +195,6 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
         snprintf(prefixed_path, sizeof(prefixed_path), "S:%s", options->image_path);
         lv_image_set_src(lock_image_obj, prefixed_path);
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
-
-        /* Custom Image mode also displays the live clock in the center.
-         * lock_clock_label is created after lock_image_obj, so it is rendered
-         * above the image automatically. */
         update_clock_display();
         lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
     } else if (current_mode == LOCK_SCREEN_MODE_CLOCK) {
@@ -209,6 +225,7 @@ void gui_lock_screen_init(void) {
     lock_clock_timer = NULL;
     lock_touch_timer = NULL;
     current_mode = LOCK_SCREEN_MODE_OFF;
+    current_clock_size = 28;
     gesture_home_state_reset(&lock_gesture_state);
 }
 

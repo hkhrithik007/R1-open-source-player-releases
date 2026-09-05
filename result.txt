@@ -1,0 +1,28 @@
+src/ui/screen_builders.c:859:    if (strcmp(text_size, "large") == 0) return &app_font_28;
+src/ui/gui_books.c:286:    lv_obj_set_style_text_font(text_reader_title_label, &app_font_28, 0); /* shows the (possibly non-Latin) file's own name -- see fallback_font.h */
+src/ui/fallback_font.c:23:lv_font_t app_font_28;
+src/ui/fallback_font.c:531:    app_font_28 = cand_28;
+src/ui/fallback_font.c:599:    app_font_28 = cand_28;
+src/ui/fallback_font.c:937:    app_font_28 = cand_28;
+src/ui/fallback_font.c:1004:    build_candidate_slot(&init_table, &app_font_28, size_28, s_custom_staged_valid, s_custom_font_generation, false);
+src/ui/fallback_font.c:1045:    app_font_28 = cand_28;
+src/ui/gui_lyrics.c:776:        lv_obj_set_style_text_font(row, &app_font_lyrics, 0); /* own separate size, not app_font_28 -- see fallback_font.h */
+src/ui/gui_library.c:1068:    lv_obj_set_style_text_font(group_songs_title_label, &app_font_28, 0); /* shows a metadata-derived artist/album/genre name -- see fallback_font.h */
+src/ui/gui_library.c:2110:    lv_obj_set_style_text_font(popup_label, &app_font_28, 0);
+src/ui/fallback_font.h:16:extern lv_font_t app_font_28;
+src/ui/gui_subsonic.c:444:    lv_obj_set_style_text_font(title_label, &app_font_28, 0); /* later re-set to a real (possibly non-Latin) server artist/album/song name -- see fallback_font.h */
+src/ui/gui_theme.c:45:        case GUI_FONT_ROLE_TITLE:   return &app_font_28;
+./src/ui/screen_builders.c:859:    if (strcmp(text_size, "large") == 0) return &app_font_28;
+./src/ui/gui_books.c:286:    lv_obj_set_style_text_font(text_reader_title_label, &app_font_28, 0); /* shows the (possibly non-Latin) file's own name -- see fallback_font.h */
+./src/ui/fallback_font.c:23:lv_font_t app_font_28;
+./src/ui/fallback_font.c:531:    app_font_28 = cand_28;
+./src/ui/fallback_font.c:599:    app_font_28 = cand_28;
+./src/ui/fallback_font.c:937:    app_font_28 = cand_28;
+./src/ui/fallback_font.c:1004:    build_candidate_slot(&init_table, &app_font_28, size_28, s_custom_staged_valid, s_custom_font_generation, false);
+./src/ui/fallback_font.c:1045:    app_font_28 = cand_28;
+./src/ui/gui_lyrics.c:776:        lv_obj_set_style_text_font(row, &app_font_lyrics, 0); /* own separate size, not app_font_28 -- see fallback_font.h */
+./src/ui/gui_library.c:1068:    lv_obj_set_style_text_font(group_songs_title_label, &app_font_28, 0); /* shows a metadata-derived artist/album/genre name -- see fallback_font.h */
+./src/ui/gui_library.c:2110:    lv_obj_set_style_text_font(popup_label, &app_font_28, 0);
+./src/ui/fallback_font.h:16:extern lv_font_t app_font_28;
+./src/ui/gui_subsonic.c:444:    lv_obj_set_style_text_font(title_label, &app_font_28, 0); /* later re-set to a real (possibly non-Latin) server artist/album/song name -- see fallback_font.h */
+./src/ui/gui_theme.c:45:        case GUI_FONT_ROLE_TITLE:   return &app_font_28;

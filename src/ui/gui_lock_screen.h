@@ -15,6 +15,7 @@ typedef struct {
     gui_lock_screen_mode_t mode;
     char image_path[256];
     bool clock_24h;
+    int clock_size;
 } gui_lock_screen_options_t;
 
 /* Returns the lock screen LVGL object, or NULL if not currently created. */

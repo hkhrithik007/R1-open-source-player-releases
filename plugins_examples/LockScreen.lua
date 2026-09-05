@@ -1,7 +1,7 @@
 plugin.define({
   id = "example.lock_screen",
   name = "Lock Screen",
-  version = "1.0",
+  version = "1.1",
   api_min = 1,
 })
 
@@ -18,6 +18,10 @@ end
 
 local STORAGE_KEY_MODE = "mode"
 local STORAGE_KEY_IMAGE = "image_path"
+
+-- 30px visual clock: rendered from the existing 28px application font
+-- using the native lock-screen transform.
+local CLOCK_SIZE = 30
 
 local MODES = {
   { key = "off",       label = "Off" },
@@ -46,7 +50,10 @@ local function trigger_lock_screen()
   local mode = get_current_mode()
   if mode == "off" then return end
 
-  local opts = { mode = mode }
+  local opts = {
+    mode = mode,
+    clock_size = CLOCK_SIZE,
+  }
   if mode == "image" then
     local img_path = get_custom_image_path()
     if not img_path or img_path == "" then return end
