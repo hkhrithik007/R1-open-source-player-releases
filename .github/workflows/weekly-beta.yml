@@ -26,9 +26,25 @@ jobs:
       - name: Set weekly release identity
         id: release
         run: |
+          set -euo pipefail
+
           release_date=$(date -u +%F)
-          echo "tag=weekly-beta-$release_date" >> "$GITHUB_OUTPUT"
-          echo "title=Weekly Beta $release_date" >> "$GITHUB_OUTPUT"
+          branch="${GITHUB_REF_NAME}"
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+          if [ "$branch" = "main" ]; then
+            echo "tag=weekly-main-$release_date" >> "$GITHUB_OUTPUT"
+            echo "title=Weekly Main $release_date" >> "$GITHUB_OUTPUT"
+            echo "type=Main Build" >> "$GITHUB_OUTPUT"
+          elif [ "$branch" = "beta" ]; then
+            echo "tag=weekly-beta-$release_date" >> "$GITHUB_OUTPUT"
+            echo "title=Weekly Beta $release_date" >> "$GITHUB_OUTPUT"
+            echo "type=Weekly Beta" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported branch: $branch" >&2
+            exit 1
+          fi
 
       - name: Install repository-cached MIPS musl toolchain
         run: |
@@ -114,17 +130,32 @@ jobs:
             > release/SHA256SUMS
 
       - name: Prepare release notes
+        env:
+          BRANCH: ${{ steps.release.outputs.branch }}
+          RELEASE_TYPE: ${{ steps.release.outputs.type }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
         run: |
           set -euo pipefail
 
           {
+            echo "# $RELEASE_TITLE"
+            echo
+            echo "**Build branch:** \`$BRANCH\`"
+            echo
+            echo "**Build type:** $RELEASE_TYPE"
+            echo
+            echo "**Commit:** [\`$GITHUB_SHA\`](https://github.com/${GITHUB_REPOSITORY}/commit/$GITHUB_SHA)"
+            echo
+            echo "---"
+            echo
+
             cat WHATS_NEW.md
 
             echo
             echo "---"
             echo
 
-            echo "Built automatically from commit [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/WHATS_NEW.md)."
+            echo "Built automatically from commit [\`${GITHUB_SHA}\`](https://github.com/${GITHUB_REPOSITORY}/commit/$GITHUB_SHA) on branch \`$BRANCH\`."
 
             echo
             echo "### Downloads"
@@ -145,7 +176,7 @@ jobs:
 
           } > release/RELEASE_NOTES.md
 
-      - name: Publish weekly prerelease
+      - name: Publish weekly release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
@@ -154,6 +185,8 @@ jobs:
           set -euo pipefail
 
           if gh release view "$TAG" >/dev/null 2>&1; then
+
+            echo "Release $TAG already exists. Updating assets and release metadata."
 
             gh release upload "$TAG" \
               release/r1.upt \
@@ -171,22 +204,30 @@ jobs:
 
             gh release edit "$TAG" \
               --prerelease \
+              --latest=false \
               --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
 
           else
+
+            echo "Creating new release $TAG."
 
             gh release create "$TAG" \
               release/r1.upt \
               release/open_hiby_player \
               release/plugin_examples.zip \
               release/SHA256SUMS \
-              --latest release \
+              --latest=false \
+              --prerelease \
               --target "$GITHUB_SHA" \
               --title "$TITLE" \
               --notes-file release/RELEASE_NOTES.md
 
           fi
+
+          echo "Release published successfully:"
+          gh release view "$TAG" \
+            --json name,tagName,isPrerelease,isLatest,targetCommitish,url
 
       - name: Preserve package as workflow artifact
         uses: actions/upload-artifact@v4
