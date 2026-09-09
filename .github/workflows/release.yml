@@ -93,5 +93,5 @@ jobs:
 
           gh release create "$TAG" release/r1.upt release/open_hiby_player \
             release/plugin_examples.zip release/SHA256SUMS \
-            --prerelease --target "$GITHUB_SHA" --title "$TITLE" \
+            --latest --target "$GITHUB_SHA" --title "$TITLE" \
             --notes-file release/RELEASE_NOTES.md
