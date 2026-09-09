@@ -1,30 +1,30 @@
-name: Build HiBy R1 Firmware
+name: Automatic Beta Release
 
 on:
   push:
     branches:
-      - main
-    tags:
-      - "v*"
+      - beta-releases
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: beta-release
+  cancel-in-progress: false
+
 env:
   STAGING_IMAGE_SHA256: ${{ secrets.STAGING_IMAGE_SHA256 }}
 
 jobs:
-  build:
-    name: Build HiBy R1 Firmware
+  beta-build:
+    name: Build, repack, and publish beta
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 75
 
     steps:
-      - name: Checkout repository
+      - name: Check out source
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install repository-cached MIPS musl toolchain
         run: |
@@ -32,26 +32,23 @@ jobs:
           toolchain_dir="$(scripts/install_mips_toolchain.sh "$RUNNER_TEMP")"
           echo "$toolchain_dir/bin" >> "$GITHUB_PATH"
 
-      - name: Install validation and repack tools
+      - name: Install build and repack tools
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            file lua5.4 zip genisoimage p7zip-full squashfs-tools
+            file genisoimage lua5.4 p7zip-full squashfs-tools zip
 
-      - name: Build open_hiby_player_target and bootloader
+      - name: Build and validate player
         run: |
           set -euo pipefail
-          make -j2 target
+          make -j2 target RELEASE_LABEL="Beta Build"
           make bootloader
-
-      - name: Verify binaries
-        run: |
-          set -euo pipefail
+          make sd_ready_test
           file open_hiby_player_target open_hiby_bootloader
-          test -s open_hiby_player_target
-          mipsel-linux-musl-readelf -h open_hiby_player_target | grep 'Machine:.*MIPS' >/dev/null
-          mipsel-linux-musl-readelf -h open_hiby_bootloader | grep 'Machine:.*MIPS' >/dev/null
-          echo "Binaries successfully built"
+          mipsel-linux-musl-readelf -h open_hiby_player_target \
+            | grep 'Machine:.*MIPS' >/dev/null
+          mipsel-linux-musl-readelf -h open_hiby_bootloader \
+            | grep 'Machine:.*MIPS' >/dev/null
 
       - name: Download verified Staging Image
         env:
@@ -72,50 +69,36 @@ jobs:
           mkdir -p release
           scripts/repack_upt.sh base/r1.upt open_hiby_player_target \
             open_hiby_bootloader release/r1.upt
+          cp open_hiby_player_target release/open_hiby_player
+          (
+            cd plugins_examples
+            zip -q -r ../release/plugin_examples.zip .
+          )
+          sha256sum release/r1.upt release/open_hiby_player \
+            release/plugin_examples.zip \
+            > release/SHA256SUMS
 
-      - name: Create automatic main build release
-        if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Publish Beta Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
-
-          cat > release-notes.txt <<EOF
-          Automatic HiBy R1 build
+          set -euo pipefail
+          TAG="beta-build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+          TITLE="Beta Build ${GITHUB_RUN_NUMBER}"
+          
+          cat > release/RELEASE_NOTES.md <<EOF
+          Automatic HiBy R1 Beta Build
 
           Commit: ${GITHUB_SHA}
           Build: ${GITHUB_RUN_NUMBER}
 
-          Binary: open_hiby_player_target
-          Full Firmware: r1.upt
+          ### Downloads
+          - **r1.upt** — complete firmware update.
+          - **open_hiby_player** — standalone Open Player update.
+          - **plugin_examples.zip** — all example and test plugins.
           EOF
 
-          gh release create "$TAG" \
-            open_hiby_player_target release/r1.upt \
-            --target "$GITHUB_SHA" \
-            --title "Latest Build" \
-            --notes-file release-notes.txt \
-            --latest
-
-      - name: Create version release
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-
-          cat > release-notes.txt <<EOF
-          HiBy R1 Player ${TAG}
-
-          Commit: ${GITHUB_SHA}
-
-          Binary: open_hiby_player_target
-          Full Firmware: r1.upt
-          EOF
-
-          gh release create "$TAG" \
-            open_hiby_player_target release/r1.upt \
-            --verify-tag \
-            --title "HiBy R1 Player ${TAG}" \
-            --notes-file release-notes.txt \
-            --latest
+          gh release create "$TAG" release/r1.upt release/open_hiby_player \
+            release/plugin_examples.zip release/SHA256SUMS \
+            --prerelease --target "$GITHUB_SHA" --title "$TITLE" \
+            --notes-file release/RELEASE_NOTES.md
