@@ -76,11 +76,13 @@ enum tag_type {
  * (covered by `need`), but guarantees available memory for the player itself
  * and potential bursts from concurrent processes (Wi-Fi, Bluetooth, Subsonic, etc.). */
 #define TAGCACHE_REBUILD_RESERVE_FLOOR (4ull * 1024ull * 1024ull)
-#define TAGCACHE_REBUILD_RESERVE_SCALE 4ull
+#define TAGCACHE_REBUILD_RESERVE_SCALE 2ull
+#define TAGCACHE_REBUILD_RESERVE_CAP (16ull * 1024ull * 1024ull)
 
 static uint64_t tagcache_rebuild_reserve(uint64_t need) {
     uint64_t scaled = need * TAGCACHE_REBUILD_RESERVE_SCALE;
-    return scaled < TAGCACHE_REBUILD_RESERVE_FLOOR ? TAGCACHE_REBUILD_RESERVE_FLOOR : scaled;
+    if (scaled < TAGCACHE_REBUILD_RESERVE_FLOOR) return TAGCACHE_REBUILD_RESERVE_FLOOR;
+    return scaled > TAGCACHE_REBUILD_RESERVE_CAP ? TAGCACHE_REBUILD_RESERVE_CAP : scaled;
 }
 
 #define TAGCACHE_NUMERIC_TAGS                                                                                          \

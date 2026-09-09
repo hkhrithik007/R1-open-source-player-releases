@@ -5014,7 +5014,7 @@ static bool scan_spool_visit_cb(const char * path, void * user) {
 
 
 #define LIBRARY_SCAN_FILE_TIMEOUT_MS 5000
-#define LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS 30000
+#define LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS 120000
 
 static void * scan_walk_worker(void * arg) {
     scan_walk_work_t * w = (scan_walk_work_t *) arg;
@@ -5083,7 +5083,7 @@ static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path
     /* The worker may be in uninterruptible I/O. Do not touch/free its state.
      * Its uniquely named spool can be orphaned safely and removed on a later
      * maintenance pass; critically, it owns no tagcache lock or GUI memory. */
-    fprintf(stderr, "Warning: scan of %s stalled with no progress for %ds (possible filesystem corruption)\n",
+    fprintf(stderr, "Warning: scan of %s stalled with no progress for %ds (possible filesystem/SD stall)\n",
             root, LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS / 1000);
     return false;
 }
