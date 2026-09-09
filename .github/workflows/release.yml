@@ -4,13 +4,15 @@ on:
   push:
     branches:
       - main
-      - beta-release
     tags:
       - "v*"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+env:
+  STAGING_IMAGE_SHA256: ${{ secrets.STAGING_IMAGE_SHA256 }}
 
 jobs:
   build:
@@ -30,27 +32,49 @@ jobs:
           toolchain_dir="$(scripts/install_mips_toolchain.sh "$RUNNER_TEMP")"
           echo "$toolchain_dir/bin" >> "$GITHUB_PATH"
 
-      - name: Install validation tools
+      - name: Install validation and repack tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends file lua5.4 zip
+          sudo apt-get install --yes --no-install-recommends \
+            file lua5.4 zip genisoimage p7zip-full squashfs-tools
 
-      - name: Build open_hiby_player_target
+      - name: Build open_hiby_player_target and bootloader
         run: |
           set -euo pipefail
           make -j2 target
+          make bootloader
 
-      - name: Verify binary
+      - name: Verify binaries
         run: |
           set -euo pipefail
-          file open_hiby_player_target
+          file open_hiby_player_target open_hiby_bootloader
           test -s open_hiby_player_target
           mipsel-linux-musl-readelf -h open_hiby_player_target | grep 'Machine:.*MIPS' >/dev/null
-          echo "Binary successfully built:"
-          ls -lh open_hiby_player_target
+          mipsel-linux-musl-readelf -h open_hiby_bootloader | grep 'Machine:.*MIPS' >/dev/null
+          echo "Binaries successfully built"
+
+      - name: Download verified Staging Image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$STAGING_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo 'STAGING_IMAGE_SHA256 secret is missing or invalid.' >&2
+            exit 1
+          }
+          mkdir -p base
+          gh release download staging-image-base --pattern r1.upt --dir base
+          echo "$STAGING_IMAGE_SHA256  base/r1.upt" | sha256sum --check
+
+      - name: Repack Staging Image
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          scripts/repack_upt.sh base/r1.upt open_hiby_player_target \
+            open_hiby_bootloader release/r1.upt
 
       - name: Create automatic main build release
-        if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/beta-release' }}
+        if: ${{ github.ref == 'refs/heads/main' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -61,15 +85,15 @@ jobs:
 
           Commit: ${GITHUB_SHA}
           Build: ${GITHUB_RUN_NUMBER}
-          Branch: ${GITHUB_REF_NAME}
 
           Binary: open_hiby_player_target
+          Full Firmware: r1.upt
           EOF
 
           gh release create "$TAG" \
-            open_hiby_player_target \
+            open_hiby_player_target release/r1.upt \
             --target "$GITHUB_SHA" \
-            --title "Latest Build (${GITHUB_REF_NAME})" \
+            --title "Latest Build" \
             --notes-file release-notes.txt \
             --latest
 
@@ -86,10 +110,11 @@ jobs:
           Commit: ${GITHUB_SHA}
 
           Binary: open_hiby_player_target
+          Full Firmware: r1.upt
           EOF
 
           gh release create "$TAG" \
-            open_hiby_player_target \
+            open_hiby_player_target release/r1.upt \
             --verify-tag \
             --title "HiBy R1 Player ${TAG}" \
             --notes-file release-notes.txt \
