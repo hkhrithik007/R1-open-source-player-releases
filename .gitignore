@@ -13,6 +13,7 @@
 /opus
 /lua
 /libexecinfo
+/jpeg
 
 # Stock-firmware UI assets (theme2 PNGs). Proprietary HiBy graphics --
 # never redistributed, see README.md's own note on this. Populate this
@@ -43,6 +44,7 @@
 /assets/theme2/stream_media/*
 !/assets/theme2/stream_media/subsonic.png
 !/assets/theme2/stream_media/subsonic_s.png
+!/assets/theme2/stream_media/download.png
 !/assets/theme2/playing_plane/
 /assets/theme2/playing_plane/*
 !/assets/theme2/playing_plane/airplay_logo_white.png
@@ -95,6 +97,15 @@
 # the public source/release tree. Match future files in any directory too.
 *selftest*
 *self_test*
+
+# *_test.c files (playlist_test.c, charge_limiter_test.c, etc.) are local-
+# only from here forward -- explicit request, distinct from the
+# *selftest*/*self_test* rule above. Does not retroactively untrack the
+# handful already committed (cover_decode_scale_test.c, metadata_artwork_
+# test.c, playlist_test.c, screen_builders_test.c, sd_ready_test.c) --
+# gitignore never affects files git already tracks; `git rm --cached` them
+# too if the intent is to stop tracking those as well.
+*_test.c
 
 # Local GUI-refactor extraction workspace
 /scratch/
