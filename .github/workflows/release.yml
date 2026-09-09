@@ -34,51 +34,92 @@ jobs:
 
       - name: Install build and repack tools
         run: |
+          set -euo pipefail
+
+          # GitHub-hosted runners may have the Google Chrome APT repository
+          # preconfigured. It is not required for this build and can
+          # occasionally fail apt-get update with a Hash Sum mismatch.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.sources
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
           sudo apt-get update
+
           sudo apt-get install --yes --no-install-recommends \
-            file genisoimage lua5.4 p7zip-full squashfs-tools zip
+            file \
+            genisoimage \
+            lua5.4 \
+            p7zip-full \
+            squashfs-tools \
+            zip
 
       - name: Build and validate player
         run: |
           set -euo pipefail
+
           make -j2 target RELEASE_LABEL="Beta Build"
           make bootloader
           make sd_ready_test
+
           file open_hiby_player_target open_hiby_bootloader
-          mipsel-linux-musl-readelf -h open_hiby_player_target | grep 'Machine:.*MIPS' >/dev/null
-          mipsel-linux-musl-readelf -h open_hiby_bootloader | grep 'Machine:.*MIPS' >/dev/null
+
+          mipsel-linux-musl-readelf -h open_hiby_player_target \
+            | grep 'Machine:.*MIPS' >/dev/null
+
+          mipsel-linux-musl-readelf -h open_hiby_bootloader \
+            | grep 'Machine:.*MIPS' >/dev/null
 
       - name: Download verified Staging Image
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           mkdir -p base
-          gh release download staging-image-base --pattern r1.upt --dir base
-          echo "$STAGING_IMAGE_SHA256  base/r1.upt" | sha256sum --check
+
+          gh release download staging-image-base \
+            --pattern r1.upt \
+            --dir base
+
+          echo "$STAGING_IMAGE_SHA256  base/r1.upt" \
+            | sha256sum --check
 
       - name: Repack Staging Image
         run: |
           set -euo pipefail
+
           mkdir -p release
-          scripts/repack_upt.sh base/r1.upt open_hiby_player_target \
-            open_hiby_bootloader release/r1.upt
+
+          scripts/repack_upt.sh \
+            base/r1.upt \
+            open_hiby_player_target \
+            open_hiby_bootloader \
+            release/r1.upt
+
           cp open_hiby_player_target release/open_hiby_player
+
           (
             cd plugins_examples
             zip -q -r ../release/plugin_examples.zip .
           )
-          sha256sum release/r1.upt release/open_hiby_player \
-            release/plugin_examples.zip > release/SHA256SUMS
+
+          sha256sum \
+            release/r1.upt \
+            release/open_hiby_player \
+            release/plugin_examples.zip \
+            > release/SHA256SUMS
 
       - name: Publish Beta Release to GitHub
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           TAG="beta-build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
           TITLE="Beta Build ${GITHUB_RUN_NUMBER}"
-          
+
           cat > release/RELEASE_NOTES.md <<EOF
           Automatic HiBy R1 Beta Build
 
@@ -86,12 +127,19 @@ jobs:
           Build: ${GITHUB_RUN_NUMBER}
 
           ### Downloads
+
           - **r1.upt** — complete firmware update.
           - **open_hiby_player** — standalone Open Player update.
           - **plugin_examples.zip** — all example and test plugins.
           EOF
 
-          gh release create "$TAG" release/r1.upt release/open_hiby_player \
-            release/plugin_examples.zip release/SHA256SUMS \
-            --latest --target "$GITHUB_SHA" --title "$TITLE" \
+          gh release create \
+            "$TAG" \
+            release/r1.upt \
+            release/open_hiby_player \
+            release/plugin_examples.zip \
+            release/SHA256SUMS \
+            --latest \
+            --target "$GITHUB_SHA" \
+            --title "$TITLE" \
             --notes-file release/RELEASE_NOTES.md
