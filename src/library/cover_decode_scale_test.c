@@ -45,13 +45,7 @@ unsigned lodepng_inspect(unsigned * w, unsigned * h, LodePNGState * state, const
     if (h) *h = 0;
     return 1;
 }
-unsigned lodepng_get_bpp(const LodePNGColorMode * info) {
-    (void) info;
-    return 32; /* arbitrary fixed value; this mock build never links real lodepng color-mode logic */
-}
-unsigned lodepng_decode(unsigned char ** out, unsigned * w, unsigned * h, LodePNGState * state,
-                        const unsigned char * in, size_t insize) {
-    (void) state;
+unsigned lodepng_decode24(unsigned char ** out, unsigned * w, unsigned * h, const unsigned char * in, size_t insize) {
     (void) in;
     (void) insize;
     if (mock_png) {

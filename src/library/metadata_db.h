@@ -28,7 +28,7 @@ typedef struct {
 /* Opens the on-disk tagcache at its fixed path (the SD-card root on
  * target, ./ on host). Safe to call more than once; a no-op if already
  * open. */
-void metadata_db_open(void);
+bool metadata_db_open(void);
 void metadata_db_close(void);
 /* True when the most recent metadata_db_open() found no saved database at
  * all on the mounted music root (fresh SD card / first run) -- see

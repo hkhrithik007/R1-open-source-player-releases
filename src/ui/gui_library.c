@@ -5053,39 +5053,42 @@ static bool scan_all_songs_with_timeout(const char * root, char * out_spool_path
         free(w);
         return false;
     }
-    pthread_detach(thread);
 
+    /* The filesystem walk itself is already running outside the UI thread.
+     * Never turn a slow SD-card walk into a false "Library update failed".
+     * The old detached-worker timeout could leave the walk alive after the
+     * caller had already abandoned the transaction. Keep the timeout as a
+     * diagnostic heartbeat, but wait for the worker and join it before using
+     * or freeing its state. */
     int last_seen_progress = 0;
     int stalled_ms = 0;
     for (;;) {
-        if (atomic_load_explicit(&w->done, memory_order_acquire)) {
-            bool ok = w->ok;
-            if (ok) {
-                snprintf(out_spool_path, out_spool_size, "%s", w->spool_path);
-                *out_count = w->count;
-            } else {
-                remove(w->spool_path);
-            }
-            free(w);
-            return ok;
-        }
+        if (atomic_load_explicit(&w->done, memory_order_acquire)) break;
         int progress = w->progress;
         if (progress != last_seen_progress) {
             last_seen_progress = progress;
             stalled_ms = 0;
         } else {
             stalled_ms += 20;
-            if (stalled_ms >= LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS) break;
+            if (stalled_ms >= LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS) {
+                fprintf(stderr, "Warning: scan of %s has made no progress for %ds; continuing to wait for SD I/O\n",
+                        root, LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS / 1000);
+                stalled_ms = 0;
+            }
         }
         usleep(20000);
     }
 
-    /* The worker may be in uninterruptible I/O. Do not touch/free its state.
-     * Its uniquely named spool can be orphaned safely and removed on a later
-     * maintenance pass; critically, it owns no tagcache lock or GUI memory. */
-    fprintf(stderr, "Warning: scan of %s stalled with no progress for %ds (possible filesystem/SD stall)\n",
-            root, LIBRARY_SCAN_WALK_STALL_TIMEOUT_MS / 1000);
-    return false;
+    pthread_join(thread, NULL);
+    bool ok = w->ok;
+    if (ok) {
+        snprintf(out_spool_path, out_spool_size, "%s", w->spool_path);
+        *out_count = w->count;
+    } else {
+        remove(w->spool_path);
+    }
+    free(w);
+    return ok;
 }
 
 static bool scan_spool_read_path(FILE * f, char * path, size_t path_size) {
@@ -5212,7 +5215,11 @@ void library_scan_once(void) {
     library_scan_progress_total = 0;
 
     DB_LOG("DB", "scan_begin root=%s rss_kb=%ld", MUSIC_ROOT_DIR, db_log_rss_kb());
-    metadata_db_open();
+    if (!metadata_db_open()) {
+        DB_LOG("DB", "db_open_failed elapsed_ms=%llu rss_kb=%ld",
+               (unsigned long long) (db_log_now_ms() - phase_started_ms), db_log_rss_kb());
+        return;
+    }
     DB_LOG("DB", "db_open elapsed_ms=%llu songs=%lld rss_kb=%ld",
            (unsigned long long) (db_log_now_ms() - phase_started_ms), (long long) metadata_db_get_song_count(),
            db_log_rss_kb());
@@ -5330,7 +5337,8 @@ void library_load_from_cache_only(void) {
     /* Close first so a remounted card is not served from a still-open
      * handle against the previous (or empty unmounted) mount. */
     metadata_db_close();
-    metadata_db_open();
+    if (!metadata_db_open())
+        DB_LOG("DB", "cache_reload_open_failed rss_kb=%ld", db_log_rss_kb());
 }
 
 bool gui_library_has_background_work(void) {

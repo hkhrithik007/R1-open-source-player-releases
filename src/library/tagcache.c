@@ -162,6 +162,12 @@ static bool db_open;
 static bool disk_ready;
 static bool opened_ok;
 static bool no_saved_database_found; /* True if no saved database files were found on disk */
+/* Update transaction state. A normal "Update Music Database" on an unchanged
+ * library must not rebuild and rewrite the entire index: that peak allocation
+ * is unnecessary and can fail on the R1 simply because of temporary RAM
+ * pressure. These flags let end_update() cheaply commit a true no-op. */
+static bool update_dirty;
+static bool update_failed;
 
 static arena_block_t * arena_blocks;
 static intern_t ** intern_exact_buckets;
@@ -2149,6 +2155,8 @@ void tagcache_close(void) {
     db_open = false;
     disk_ready = false;
     opened_ok = false;
+    update_dirty = false;
+    update_failed = false;
     disk_gen = 0;
     db_dir[0] = '\0';
 }
@@ -2165,6 +2173,8 @@ bool tagcache_had_no_saved_database(void) {
 void tagcache_begin_update(void) {
     if (!db_open) return;
     tagcache_flush_numeric();
+    update_dirty = false;
+    update_failed = false;
     for (int32_t i = 0; i < ent_count; i++) ents[i].flag &= ~FLAG_SEEN;
 }
 
@@ -2186,11 +2196,13 @@ void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char 
     if (!db_open || !path) return;
     int32_t idx = path_hash_find(path);
     if (idx >= 0 && !(ents[idx].flag & FLAG_DELETED)) {
+        update_dirty = true;
         apply_tags(&ents[idx], path, mtime, size, title, artist, album, album_artist, genre,
                    track_number, disc_number);
         return;
     }
     if (idx >= 0) {
+        update_dirty = true;
         int32_t first_seen = ents[idx].first_seen;
         int32_t playcount = ents[idx].playcount;
         int32_t last_played = ents[idx].last_played;
@@ -2205,8 +2217,10 @@ void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char 
     }
     if (!ensure_cap(ent_count + 1)) {
         fprintf(stderr, "tagcache: at TAGCACHE_MAX_ENTRIES (%d), dropping %s\n", TAGCACHE_MAX_ENTRIES, path);
+        update_failed = true;
         return;
     }
+    update_dirty = true;
     idx = ent_count++;
     memset(&ents[idx], 0, sizeof(ents[idx]));
     apply_tags(&ents[idx], path, mtime, size, title, artist, album, album_artist, genre,
@@ -2218,21 +2232,51 @@ void tagcache_upsert(const char * path, int32_t mtime, int32_t size, const char 
 bool tagcache_end_update(bool prune) {
     if (!db_open) return false;
     tagcache_flush_numeric();
+    if (update_failed) {
+        reload_from_disk();
+        update_dirty = false;
+        update_failed = false;
+        return false;
+    }
+
+    bool removed_any = false;
     if (prune) {
         for (int32_t i = 0; i < ent_count; i++) {
             if (ents[i].flag & FLAG_DELETED) continue;
-            if (!(ents[i].flag & FLAG_SEEN)) ents[i].flag |= FLAG_DELETED;
+            if (!(ents[i].flag & FLAG_SEEN)) {
+                ents[i].flag |= FLAG_DELETED;
+                removed_any = true;
+            }
         }
     }
+
+    /* If every discovered file was already cached with matching metadata and
+     * no file disappeared, the current indexes are already valid. Avoid the
+     * expensive rebuild/write generation entirely. This is the normal case
+     * when the user presses Settings > Update Music Database without changing
+     * anything on the SD card. */
+    if (!update_dirty && !removed_any) {
+        for (int32_t i = 0; i < ent_count; i++) ents[i].flag &= ~FLAG_SEEN;
+        return true;
+    }
+
     for (int32_t i = 0; i < ent_count; i++) ents[i].flag &= ~FLAG_SEEN;
     drop_derived_indexes_before_rebuild();
     if (!rebuild_indexes() || !write_all()) {
         reload_from_disk();
+        update_dirty = false;
+        update_failed = false;
         return false;
     }
     if (!intern_path_title || !choose_intern_strings(live_count)) {
-        if (!reload_from_disk()) return false;
+        if (!reload_from_disk()) {
+            update_dirty = false;
+            update_failed = false;
+            return false;
+        }
     }
+    update_dirty = false;
+    update_failed = false;
     return true;
 }
 

@@ -8,6 +8,7 @@
 
 #include <limits.h>
 #include <stdint.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,17 +179,27 @@ static bool song_matches_filters(const tagcache_song_t * song, const char * quer
     return true;
 }
 
-void metadata_db_open(void) {
+bool metadata_db_open(void) {
     METADATA_DB_GUARD;
-    if (db_ready) return;
+    if (db_ready) return true;
 
 #ifndef HOST_BUILD
-    if (!music_root_is_mounted()) return;
+    if (!music_root_is_mounted()) {
+        fprintf(stderr, "metadata_db: music root is not mounted\n");
+        return false;
+    }
 #endif
 
-    mkdir(METADATA_DB_DIR, 0755);
-    if (!tagcache_open(METADATA_DB_DIR)) return;
+    if (mkdir(METADATA_DB_DIR, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "metadata_db: mkdir %s failed: %s\n", METADATA_DB_DIR, strerror(errno));
+        return false;
+    }
+    if (!tagcache_open(METADATA_DB_DIR) || !tagcache_is_open()) {
+        fprintf(stderr, "metadata_db: tagcache open failed: %s\n", METADATA_DB_DIR);
+        return false;
+    }
     db_ready = true;
+    return true;
 }
 
 bool metadata_db_had_no_saved_database(void) {
