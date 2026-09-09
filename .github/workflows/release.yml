@@ -45,20 +45,14 @@ jobs:
           make bootloader
           make sd_ready_test
           file open_hiby_player_target open_hiby_bootloader
-          mipsel-linux-musl-readelf -h open_hiby_player_target \
-            | grep 'Machine:.*MIPS' >/dev/null
-          mipsel-linux-musl-readelf -h open_hiby_bootloader \
-            | grep 'Machine:.*MIPS' >/dev/null
+          mipsel-linux-musl-readelf -h open_hiby_player_target | grep 'Machine:.*MIPS' >/dev/null
+          mipsel-linux-musl-readelf -h open_hiby_bootloader | grep 'Machine:.*MIPS' >/dev/null
 
       - name: Download verified Staging Image
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$STAGING_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
-            echo 'STAGING_IMAGE_SHA256 secret is missing or invalid.' >&2
-            exit 1
-          }
           mkdir -p base
           gh release download staging-image-base --pattern r1.upt --dir base
           echo "$STAGING_IMAGE_SHA256  base/r1.upt" | sha256sum --check
@@ -75,10 +69,9 @@ jobs:
             zip -q -r ../release/plugin_examples.zip .
           )
           sha256sum release/r1.upt release/open_hiby_player \
-            release/plugin_examples.zip \
-            > release/SHA256SUMS
+            release/plugin_examples.zip > release/SHA256SUMS
 
-      - name: Publish Beta Release
+      - name: Publish Beta Release to GitHub
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
