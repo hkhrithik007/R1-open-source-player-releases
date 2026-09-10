@@ -192,11 +192,24 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
 
         /* Album art should behave like a full-screen wallpaper: make the
          * image widget cover the whole lock screen while preserving the
-         * artwork's aspect ratio. This crops the excess instead of leaving
-         * black bars around the album art. */
+         * artwork's aspect ratio. The R1's LVGL build does not provide
+         * LV_IMAGE_ALIGN_COVER, so calculate the equivalent scale manually.
+         * The larger scale factor is used so the image completely covers the
+         * screen; the excess is cropped by the screen bounds. */
         lv_obj_set_size(lock_image_obj, LV_PCT(100), LV_PCT(100));
         lv_obj_set_align(lock_image_obj, LV_ALIGN_CENTER);
-        lv_image_set_inner_align(lock_image_obj, LV_IMAGE_ALIGN_COVER);
+        lv_image_set_inner_align(lock_image_obj, LV_IMAGE_ALIGN_CENTER);
+
+        int32_t image_w = lv_image_get_src_width(lock_image_obj);
+        int32_t image_h = lv_image_get_src_height(lock_image_obj);
+        int32_t screen_w = lv_obj_get_width(lock_image_obj);
+        int32_t screen_h = lv_obj_get_height(lock_image_obj);
+        if (image_w > 0 && image_h > 0 && screen_w > 0 && screen_h > 0) {
+            uint32_t scale_x = ((uint32_t) screen_w * 256U + (uint32_t) image_w - 1U) / (uint32_t) image_w;
+            uint32_t scale_y = ((uint32_t) screen_h * 256U + (uint32_t) image_h - 1U) / (uint32_t) image_h;
+            uint32_t cover_scale = scale_x > scale_y ? scale_x : scale_y;
+            lv_image_set_scale(lock_image_obj, cover_scale);
+        }
 
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
         update_clock_display();
@@ -215,10 +228,12 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
         lv_image_set_src(lock_image_obj, prefixed_path);
 
         /* Custom images keep their existing natural/content-sized behavior.
-         * Only Album Art is treated as a full-screen cover. */
+         * Only Album Art is treated as a full-screen cover. Reset the image
+         * scale here so the previous album-art scale cannot carry over. */
         lv_obj_set_size(lock_image_obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
         lv_obj_set_align(lock_image_obj, LV_ALIGN_CENTER);
         lv_image_set_inner_align(lock_image_obj, LV_IMAGE_ALIGN_DEFAULT);
+        lv_image_set_scale(lock_image_obj, 256);
 
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
         update_clock_display();
