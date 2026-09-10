@@ -189,6 +189,15 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
         } else {
             lv_image_set_src(lock_image_obj, asset_path("playing_plane/default_cover_565.png"));
         }
+
+        /* Album art should behave like a full-screen wallpaper: make the
+         * image widget cover the whole lock screen while preserving the
+         * artwork's aspect ratio. This crops the excess instead of leaving
+         * black bars around the album art. */
+        lv_obj_set_size(lock_image_obj, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_align(lock_image_obj, LV_ALIGN_CENTER);
+        lv_image_set_inner_align(lock_image_obj, LV_IMAGE_ALIGN_COVER);
+
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
         update_clock_display();
         lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
@@ -204,6 +213,13 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
         char prefixed_path[sizeof(options->image_path) + 2];
         snprintf(prefixed_path, sizeof(prefixed_path), "S:%s", options->image_path);
         lv_image_set_src(lock_image_obj, prefixed_path);
+
+        /* Custom images keep their existing natural/content-sized behavior.
+         * Only Album Art is treated as a full-screen cover. */
+        lv_obj_set_size(lock_image_obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_align(lock_image_obj, LV_ALIGN_CENTER);
+        lv_image_set_inner_align(lock_image_obj, LV_IMAGE_ALIGN_DEFAULT);
+
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
         update_clock_display();
         lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
