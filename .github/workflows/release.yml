@@ -42,17 +42,29 @@ jobs:
       - name: Verify binary
         run: |
           set -euo pipefail
-          file open_hiby_player_target
-          test -s open_hiby_player_target
-          mipsel-linux-musl-readelf -h open_hiby_player_target | grep 'Machine:.*MIPS' >/dev/null
+
+          BINARY="open_hiby_player_target_r1"
+
+          echo "Verifying binary: $BINARY"
+
+          test -f "$BINARY"
+          test -s "$BINARY"
+
+          file "$BINARY"
+
+          mipsel-linux-musl-readelf -h "$BINARY" | grep 'Machine:.*MIPS' >/dev/null
+
           echo "Binary successfully built:"
-          ls -lh open_hiby_player_target
+          ls -lh "$BINARY"
 
       - name: Create automatic main build release
         if: ${{ github.ref == 'refs/heads/main' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
+          BINARY="open_hiby_player_target_r1"
           TAG="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
 
           cat > release-notes.txt <<EOF
@@ -61,11 +73,11 @@ jobs:
           Commit: ${GITHUB_SHA}
           Build: ${GITHUB_RUN_NUMBER}
 
-          Binary: open_hiby_player_target
+          Binary: ${BINARY}
           EOF
 
           gh release create "$TAG" \
-            open_hiby_player_target \
+            "$BINARY" \
             --target "$GITHUB_SHA" \
             --title "Latest Build" \
             --notes-file release-notes.txt \
@@ -76,6 +88,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+
+          BINARY="open_hiby_player_target_r1"
           TAG="${GITHUB_REF_NAME}"
 
           cat > release-notes.txt <<EOF
@@ -83,11 +98,11 @@ jobs:
 
           Commit: ${GITHUB_SHA}
 
-          Binary: open_hiby_player_target
+          Binary: ${BINARY}
           EOF
 
           gh release create "$TAG" \
-            open_hiby_player_target \
+            "$BINARY" \
             --verify-tag \
             --title "HiBy R1 Player ${TAG}" \
             --notes-file release-notes.txt \
