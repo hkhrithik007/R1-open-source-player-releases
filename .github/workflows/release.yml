@@ -43,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          BINARY="open_hiby_player_target_r1"
+          BINARY="open_hiby_player_target"
 
           echo "Verifying binary: $BINARY"
 
@@ -64,7 +64,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          BINARY="open_hiby_player_target_r1"
+          BINARY="open_hiby_player_target"
           TAG="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
 
           cat > release-notes.txt <<EOF
@@ -90,7 +90,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          BINARY="open_hiby_player_target_r1"
+          BINARY="open_hiby_player_target"
           TAG="${GITHUB_REF_NAME}"
 
           cat > release-notes.txt <<EOF
