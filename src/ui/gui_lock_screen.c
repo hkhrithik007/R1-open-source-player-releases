@@ -184,6 +184,14 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
 
     if (current_mode == LOCK_SCREEN_MODE_ALBUM_ART) {
         const lv_image_dsc_t * cover = gui_player_get_current_cover_dsc();
+        /* Start from the image's natural/content size so we can read its
+         * loaded dimensions using the object itself. This avoids newer LVGL
+         * helper APIs that are not linked into the R1 firmware. */
+        lv_obj_set_size(lock_image_obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_align(lock_image_obj, LV_ALIGN_CENTER);
+        lv_image_set_inner_align(lock_image_obj, LV_IMAGE_ALIGN_DEFAULT);
+        lv_image_set_scale(lock_image_obj, 256);
+
         if (cover && cover->data) {
             lv_image_set_src(lock_image_obj, cover);
         } else {
@@ -193,23 +201,27 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
         /* Album art should behave like a full-screen wallpaper: make the
          * image widget cover the whole lock screen while preserving the
          * artwork's aspect ratio. The R1's LVGL build does not provide
-         * LV_IMAGE_ALIGN_COVER, so calculate the equivalent scale manually.
-         * The larger scale factor is used so the image completely covers the
-         * screen; the excess is cropped by the screen bounds. */
-        lv_obj_set_size(lock_image_obj, LV_PCT(100), LV_PCT(100));
-        lv_obj_set_align(lock_image_obj, LV_ALIGN_CENTER);
-        lv_image_set_inner_align(lock_image_obj, LV_IMAGE_ALIGN_CENTER);
+         * LV_IMAGE_ALIGN_COVER or the newer get-src-dimensions helpers, so
+         * use the natural size reported by the image object and calculate
+         * the equivalent zoom manually. The larger scale factor is used so
+         * the image completely covers the screen; the excess is cropped by
+         * the image object's full-screen bounds. */
+        int32_t image_w = lv_obj_get_width(lock_image_obj);
+        int32_t image_h = lv_obj_get_height(lock_image_obj);
+        int32_t screen_w = lv_obj_get_width(lock_screen);
+        int32_t screen_h = lv_obj_get_height(lock_screen);
+        uint32_t cover_scale = 256;
 
-        int32_t image_w = lv_image_get_src_width(lock_image_obj);
-        int32_t image_h = lv_image_get_src_height(lock_image_obj);
-        int32_t screen_w = lv_obj_get_width(lock_image_obj);
-        int32_t screen_h = lv_obj_get_height(lock_image_obj);
         if (image_w > 0 && image_h > 0 && screen_w > 0 && screen_h > 0) {
             uint32_t scale_x = ((uint32_t) screen_w * 256U + (uint32_t) image_w - 1U) / (uint32_t) image_w;
             uint32_t scale_y = ((uint32_t) screen_h * 256U + (uint32_t) image_h - 1U) / (uint32_t) image_h;
-            uint32_t cover_scale = scale_x > scale_y ? scale_x : scale_y;
-            lv_image_set_scale(lock_image_obj, cover_scale);
+            cover_scale = scale_x > scale_y ? scale_x : scale_y;
         }
+
+        lv_obj_set_size(lock_image_obj, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_align(lock_image_obj, LV_ALIGN_CENTER);
+        lv_image_set_inner_align(lock_image_obj, LV_IMAGE_ALIGN_CENTER);
+        lv_image_set_scale(lock_image_obj, cover_scale);
 
         lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
         update_clock_display();
