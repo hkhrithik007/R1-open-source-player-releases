@@ -19,7 +19,6 @@ static lv_timer_t * lock_touch_timer = NULL;
 
 static gui_lock_screen_mode_t current_mode = LOCK_SCREEN_MODE_OFF;
 static bool current_clock_24h = true;
-static int current_clock_size = 28;
 
 /* Swipe-up-to-dismiss tracking -- reuses the same detector already driving
  * the home-indicator swipe gesture elsewhere (gui_shell.c) rather than
@@ -70,25 +69,7 @@ static void update_clock_display(void) {
     strftime(buf, sizeof(buf), current_clock_24h ? "%H:%M" : "%I:%M", &tm_info);
     lv_label_set_text(lock_clock_label, buf);
 
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-    /* The project has a 28px application font as its largest general UI
-     * font. Use LVGL's object transform to render a plugin-requested clock
-     * size without changing the global font table. 256 = 1.0x. */
-    lv_obj_update_layout(lock_clock_label);
-    int32_t scale = (256 * current_clock_size + 14) / 28;
-    if (scale < 256) scale = 256;
-    lv_obj_set_style_transform_scale(lock_clock_label, scale, 0);
-    lv_obj_set_style_transform_pivot_x(
-        lock_clock_label, lv_obj_get_width(lock_clock_label) / 2, 0);
-    lv_obj_set_style_transform_pivot_y(
-        lock_clock_label, lv_obj_get_height(lock_clock_label) / 2, 0);
-=======
 
->>>>>>> Stashed changes
-=======
-
->>>>>>> Stashed changes
 }
 
 static void lock_clock_timer_cb(lv_timer_t * timer) {
@@ -195,13 +176,6 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
 
     current_mode = options->mode;
     current_clock_24h = options->clock_24h;
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-    current_clock_size = options->clock_size;
-    if (current_clock_size < 16 || current_clock_size > 48) {
-        current_clock_size = 28;
-    }
-
     /* Reset elements */
     lv_anim_del(lock_image_obj, lock_image_opa_anim_cb);
     lv_obj_set_style_opa(lock_image_obj, LV_OPA_COVER, 0);
@@ -249,104 +223,6 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
         }
     }
 
-=======
-    /* Reset elements */
-    lv_anim_del(lock_image_obj, lock_image_opa_anim_cb);
-    lv_obj_set_style_opa(lock_image_obj, LV_OPA_COVER, 0);
-    lv_obj_add_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
-
-    if (current_mode == LOCK_SCREEN_MODE_ALBUM_ART) {
-        const lv_image_dsc_t * cover = gui_player_get_current_cover_dsc();
-        if (cover && cover->data) {
-            lv_image_set_src(lock_image_obj, cover);
-        } else {
-            lv_image_set_src(lock_image_obj, asset_path("playing_plane/default_cover_565.png"));
-        }
-        lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
-        update_clock_display();
-        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
-    } else if (current_mode == LOCK_SCREEN_MODE_IMAGE) {
-        /* LVGL's lv_fs_get_drv() picks a driver off src[0] -- a plain POSIX
-         * path (what plugin.sd_root() and every plugin-supplied path use)
-         * has no registered driver (only the 'S' POSIX driver is, see
-         * lv_conf.h), so lv_fs_open() fails silently and the image never
-         * loads without this prefix. Same "S:" convention every other
-         * file-path image source in this codebase uses (assets.c's
-         * asset_path()). lv_image_set_src() strdup()s file-path sources
-         * internally, so this stack buffer doesn't need to outlive the call. */
-        char prefixed_path[sizeof(options->image_path) + 2];
-        snprintf(prefixed_path, sizeof(prefixed_path), "S:%s", options->image_path);
-        lv_image_set_src(lock_image_obj, prefixed_path);
-        lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
-        update_clock_display();
-        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
-    } else if (current_mode == LOCK_SCREEN_MODE_CLOCK) {
-        update_clock_display();
-        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    start_timers();
-
-    bool opening = (lv_screen_active() != lock_screen);
-    if (opening) {
-        nav_push(lock_screen);
-
-        if (current_mode == LOCK_SCREEN_MODE_IMAGE) {
-            animate_custom_lock_image();
-        }
-    }
-
->>>>>>> Stashed changes
-=======
-    /* Reset elements */
-    lv_anim_del(lock_image_obj, lock_image_opa_anim_cb);
-    lv_obj_set_style_opa(lock_image_obj, LV_OPA_COVER, 0);
-    lv_obj_add_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
-
-    if (current_mode == LOCK_SCREEN_MODE_ALBUM_ART) {
-        const lv_image_dsc_t * cover = gui_player_get_current_cover_dsc();
-        if (cover && cover->data) {
-            lv_image_set_src(lock_image_obj, cover);
-        } else {
-            lv_image_set_src(lock_image_obj, asset_path("playing_plane/default_cover_565.png"));
-        }
-        lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
-        update_clock_display();
-        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
-    } else if (current_mode == LOCK_SCREEN_MODE_IMAGE) {
-        /* LVGL's lv_fs_get_drv() picks a driver off src[0] -- a plain POSIX
-         * path (what plugin.sd_root() and every plugin-supplied path use)
-         * has no registered driver (only the 'S' POSIX driver is, see
-         * lv_conf.h), so lv_fs_open() fails silently and the image never
-         * loads without this prefix. Same "S:" convention every other
-         * file-path image source in this codebase uses (assets.c's
-         * asset_path()). lv_image_set_src() strdup()s file-path sources
-         * internally, so this stack buffer doesn't need to outlive the call. */
-        char prefixed_path[sizeof(options->image_path) + 2];
-        snprintf(prefixed_path, sizeof(prefixed_path), "S:%s", options->image_path);
-        lv_image_set_src(lock_image_obj, prefixed_path);
-        lv_obj_remove_flag(lock_image_obj, LV_OBJ_FLAG_HIDDEN);
-        update_clock_display();
-        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
-    } else if (current_mode == LOCK_SCREEN_MODE_CLOCK) {
-        update_clock_display();
-        lv_obj_remove_flag(lock_clock_label, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    start_timers();
-
-    bool opening = (lv_screen_active() != lock_screen);
-    if (opening) {
-        nav_push(lock_screen);
-
-        if (current_mode == LOCK_SCREEN_MODE_IMAGE) {
-            animate_custom_lock_image();
-        }
-    }
-
->>>>>>> Stashed changes
     return true;
 }
 
@@ -364,13 +240,6 @@ void gui_lock_screen_init(void) {
     lock_clock_timer = NULL;
     lock_touch_timer = NULL;
     current_mode = LOCK_SCREEN_MODE_OFF;
-<<<<<<< Updated upstream
-<<<<<<< Updated upstream
-    current_clock_size = 28;
-=======
->>>>>>> Stashed changes
-=======
->>>>>>> Stashed changes
     gesture_home_state_reset(&lock_gesture_state);
 }
 
