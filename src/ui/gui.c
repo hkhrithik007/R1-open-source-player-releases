@@ -1,6 +1,7 @@
 #include "gui.h"
 #include "app_clock.h"
 #include "gui_library.h"
+#include "gui_lock_screen.h"
 #include "gui_queue.h"
 #include "gui_player.h"
 #include "gui_plugins.h"
@@ -251,7 +252,6 @@ void gui_reset_interactive_timeout_baseline(void) {
 /* The panel dominates power while lit. Dim well before the configured full
  * timeout, but keep enough time for reading and never override an explicit
  * user's screen-off duration. */
-#define SCREEN_DIM_AFTER_MS 10000U
 #define VISIBLE_STATUS_POLL_TICKS 4 /* 2 seconds at the 500 ms control tick */
 static bool radios_suspended = false;
 static bool wifi_was_on_before_suspend = false;
@@ -313,6 +313,7 @@ static void apply_screen_runtime_state(bool screen_on) {
 
     gui_shell_reset_drag_state();
     gui_library_reset_drag_state();
+    gui_lock_screen_reset_drag_state();
 
     lv_timer_t * refr_timer = lv_display_get_refr_timer(lv_display_get_default());
     if (refr_timer) {
@@ -783,12 +784,16 @@ static void update_timer_cb(lv_timer_t * timer) {
      * remain readable without requiring continuous touch input. When paused, normal
      * timeout applies. */
     bool lyrics_screen_active = lv_screen_active() == gui_lyrics_get_screen() && audio_is_playing();
+    uint32_t active_dim_delay_ms = (uint32_t) current_settings.screen_dim_delay_seconds * 1000;
+    if (current_settings.screen_timeout_enabled && active_dim_delay_ms >= (uint32_t) current_settings.screen_timeout_seconds * 1000) {
+        active_dim_delay_ms = UINT32_MAX; /* Prevent dimming if delay exceeds or equals timeout */
+    }
     if (current_settings.screen_dimming_enabled && screen_on_before_timeout &&
-        !inactivity_dimmed && !lyrics_screen_active && screen_inactive_ms >= SCREEN_DIM_AFTER_MS) {
+        !inactivity_dimmed && !lyrics_screen_active && screen_inactive_ms >= active_dim_delay_ms) {
         backlight_set_dimmed(true);
         inactivity_dimmed = true;
     } else if (screen_on_before_timeout && inactivity_dimmed &&
-               (!current_settings.screen_dimming_enabled || lyrics_screen_active || screen_inactive_ms < SCREEN_DIM_AFTER_MS)) {
+               (!current_settings.screen_dimming_enabled || lyrics_screen_active || screen_inactive_ms < active_dim_delay_ms)) {
         backlight_set_dimmed(false);
         inactivity_dimmed = false;
     }
