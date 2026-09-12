@@ -25,12 +25,18 @@ static void stop_timers(void);
 
 static gesture_home_state_t lock_gesture_state;
 
-/* gui_navigation.c calls this from its compositor-failure recovery path.
- * The lock-screen swipe uses the LVGL transition path (vertical reveal), not
- * the direct-framebuffer compositor, so there is no lock-owned compositor
- * context to recover here. */
+/* Reset lock-screen gesture state whenever the display runtime state changes.
+ * gui.c calls this alongside the Home/Library drag-state resets. */
+void gui_lock_screen_reset_drag_state(void) {
+    gesture_home_state_reset(&lock_gesture_state);
+}
+
+/* gui_navigation.c calls this from compositor-failure recovery. The lock
+ * screen has no separate compositor-owned gesture context; clearing its
+ * gesture state is sufficient. */
 void gui_lock_screen_swipe_recover(void * ctx) {
     (void) ctx;
+    gesture_home_state_reset(&lock_gesture_state);
 }
 
 lv_obj_t * gui_lock_screen_get_screen(void) {

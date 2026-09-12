@@ -23,6 +23,7 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options);
 void gui_lock_screen_hide(void);
 void gui_lock_screen_init(void);
 void gui_lock_screen_teardown(void);
+void gui_lock_screen_reset_drag_state(void);
 void gui_lock_screen_swipe_recover(void * ctx);
 
 #endif /* GUI_LOCK_SCREEN_H */
