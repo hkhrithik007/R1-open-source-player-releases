@@ -83,6 +83,11 @@ static void lock_clock_timer_cb(lv_timer_t * timer) {
     update_clock_display();
 }
 
+static void lock_settle_done_cb(lv_anim_t * a) {
+    lock_settle_ctx = NULL;
+    slide_transition_done_cb(a);
+}
+
 static void lock_swipe_reset_state(void) {
     lock_swipe_candidate = false;
     lock_swipe_tracking = false;
@@ -144,8 +149,11 @@ static void lock_touch_timer_cb(lv_timer_t * timer) {
                         lock_swipe_last_v = 0;
                         lock_swipe_last_velocity = 0;
                         /* The transition owns the visual gesture from here.
-                         * Do not let the underlying screen consume this press. */
-                        lv_indev_wait_release(indev);
+                         * Do NOT call lv_indev_wait_release() here: this lock-screen
+                         * timer must continue seeing the finger as PRESSED so the
+                         * transition can follow p.y every refresh tick. The transition
+                         * overlay is made CLICKABLE and therefore swallows the touch
+                         * once it exists. */
                     }
                 }
             }
