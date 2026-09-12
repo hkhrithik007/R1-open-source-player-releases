@@ -7,6 +7,7 @@
 #include "assets.h"
 #include "screen_builders.h"
 #include "backlight.h"
+#include "gesture_detector.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -22,20 +23,15 @@ static bool current_clock_24h = true;
 
 static void stop_timers(void);
 
-/* Live swipe-up-to-dismiss tracking. This deliberately mirrors the existing
- * Home swipe in gui_shell.c: the transition is created once at the deadzone,
- * the finger drives its position every poll tick, and release gets a short
- * ease-out settle instead of waiting for a gesture event and then starting a
- * fresh animation. */
-static bool lock_swipe_candidate = false;
-static bool lock_swipe_tracking = false;
-static bool lock_swipe_just_confirmed = false;
-static int32_t lock_swipe_touch_start_y = 0;
-static int32_t lock_swipe_last_v = 0;
-static int32_t lock_swipe_last_velocity = 0;
-static slide_transition_ctx_t * lock_swipe_ctx = NULL;
-#define LOCK_SWIPE_DEADZONE 20
-#define LOCK_SWIPE_SETTLE_MS 120
+static gesture_home_state_t lock_gesture_state;
+
+/* gui_navigation.c calls this from its compositor-failure recovery path.
+ * The lock-screen swipe uses the LVGL transition path (vertical reveal), not
+ * the direct-framebuffer compositor, so there is no lock-owned compositor
+ * context to recover here. */
+void gui_lock_screen_swipe_recover(void * ctx) {
+    (void) ctx;
+}
 
 lv_obj_t * gui_lock_screen_get_screen(void) {
     return lock_screen;
@@ -96,112 +92,33 @@ static void lock_touch_timer_cb(lv_timer_t * timer) {
     bool pressed = (lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED);
     lv_point_t p;
     lv_indev_get_point(indev, &p);
-    int32_t h = lv_display_get_vertical_resolution(lv_display_get_default());
 
-    if (pressed && !lock_swipe_candidate && !lock_swipe_tracking) {
-        lock_swipe_candidate = true;
-        lock_swipe_touch_start_y = p.y;
-        lock_swipe_last_v = 0;
-        lock_swipe_last_velocity = 0;
-    }
+    gesture_home_config_t cfg;
+    int32_t screen_height =
+        lv_display_get_vertical_resolution(lv_display_get_default());
 
-    if (pressed && lock_swipe_candidate && !lock_swipe_tracking) {
-        int32_t dy = p.y - lock_swipe_touch_start_y;
-        int32_t ady = dy < 0 ? -dy : dy;
+    cfg.swipe_up_home_enabled = true;
+    cfg.quick_drawer_open = false;
+    cfg.is_bt_dac_overlay = false;
+    cfg.is_usb_dac_overlay = false;
+    cfg.is_lyrics_screen = false;
+    cfg.is_lock_screen = false;
+    cfg.has_background_work = false;
+    cfg.screen_height = screen_height;
+    cfg.band_height = screen_height;
 
-        if (ady >= LOCK_SWIPE_DEADZONE) {
-            /* Only an upward, predominantly vertical drag dismisses the lock
-             * screen. A horizontal/ downward movement is rejected for this
-             * press so taps and other input are not stolen. */
-            if (dy < 0) {
-                lv_obj_t * target = NULL;
-                int depth = gui_navigation_get_depth();
-                if (depth > 1)
-                    target = gui_navigation_get_screen_at(depth - 2);
+    bool dismiss = gesture_home_state_poll(
+        &lock_gesture_state,
+        &cfg,
+        pressed,
+        p.y
+    );
 
-                if (target) {
-                    lock_swipe_ctx = begin_slide_transition_ex(
-                        target, true, true, true);
-                    if (lock_swipe_ctx) {
-                        /* Do not change the nav stack until release. A
-                         * cancelled drag therefore returns to the lock screen
-                         * without disturbing navigation history. */
-                        lock_swipe_ctx->commit = false;
-                        lock_swipe_tracking = true;
-                        lock_swipe_just_confirmed = true;
-                        lock_swipe_last_v = 0;
-                        lock_swipe_last_velocity = 0;
-
-                        /* The transition overlay is now directly under the
-                         * still-down finger. Keep the eventual release from
-                         * being delivered to whatever is exposed underneath. */
-                        lv_indev_wait_release(indev);
-                    }
-                }
-            } else {
-                /* Once the movement is horizontal/downward, stop considering
-                 * this press a lock-screen swipe. */
-                lv_indev_wait_release(indev);
-            }
-            lock_swipe_candidate = false;
-        }
-    }
-
-    if (pressed && lock_swipe_tracking) {
-        int32_t v = p.y - lock_swipe_touch_start_y;
-        if (v > 0) v = 0;
-        if (v < -h) v = -h;
-
-        int32_t delta = v - lock_swipe_last_v;
-        if (delta != 0) lock_swipe_last_velocity = delta;
-        lock_swipe_last_v = v;
-
-        /* The first tick after begin_slide_transition_ex() is deliberately
-         * skipped. The transition setup can take long enough that presenting
-         * frame 0 in that same tick produces the exact start-of-swipe hitch
-         * seen in the old implementation. */
-        if (lock_swipe_just_confirmed) {
-            lock_swipe_just_confirmed = false;
-        } else if (lock_swipe_ctx) {
-            slide_transition_anim_x_cb(lock_swipe_ctx, v);
-        }
-    }
-
-    if (!pressed && lock_swipe_tracking && lock_swipe_ctx) {
-        lock_swipe_tracking = false;
-        lock_swipe_candidate = false;
-
-        int32_t current_v = lock_swipe_last_v;
-        bool commit;
-        if (lock_swipe_last_velocity < 0) {
-            commit = true;
-        } else if (lock_swipe_last_velocity > 0) {
-            commit = false;
-        } else {
-            commit = current_v < -h / 2;
-        }
-
-        slide_transition_ctx_t * ctx = lock_swipe_ctx;
-        ctx->commit = commit;
-
-        if (commit) {
-            /* Keep the navigation stack unchanged until the settle animation
-             * finishes, exactly like gui_shell.c's live Home swipe. */
-            nav_pop_stack_only();
-            stop_timers();
-        }
-
-        lv_anim_t a;
-        lv_anim_init(&a);
-        lv_anim_set_var(&a, ctx);
-        lv_anim_set_user_data(&a, ctx);
-        lv_anim_set_values(&a, current_v, commit ? -h : 0);
-        lv_anim_set_duration(&a, LOCK_SWIPE_SETTLE_MS);
-        lv_anim_set_exec_cb(&a, slide_transition_anim_x_cb);
-        lv_anim_set_completed_cb(&a, slide_transition_done_cb);
-        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-        lv_anim_start(&a);
-        lock_swipe_ctx = NULL;
+    if (dismiss) {
+        /* Prevent the release from falling through to the screen underneath
+         * and triggering an accidental tap when the lock screen disappears. */
+        lv_indev_wait_release(indev);
+        gui_lock_screen_hide();
     }
 }
 
@@ -377,29 +294,9 @@ bool gui_lock_screen_show(const gui_lock_screen_options_t * options) {
  * slides up and away over it, rather than a plain horizontal back-slide. */
 void gui_lock_screen_hide(void) {
     stop_timers();
-    lock_swipe_candidate = false;
-    lock_swipe_tracking = false;
-    lock_swipe_just_confirmed = false;
-    if (lock_swipe_ctx) {
-        slide_transition_cancel(&lock_swipe_ctx);
-    }
     if (lock_screen && lv_screen_active() == lock_screen) {
         nav_pop_ex(true, true, true);
     }
-}
-
-/* Called by gui_navigation.c if the shared transition compositor reports a
- * hard presentation failure while a lock-screen swipe is in flight. The
- * navigation layer restores the logical source/destination screen before
- * freeing the transition context; all we need to do here is drop our stale
- * tracking pointer so it can never be driven after that free. */
-void gui_lock_screen_swipe_recover(void * ctx) {
-    if (ctx == (void *) lock_swipe_ctx) lock_swipe_ctx = NULL;
-    lock_swipe_tracking = false;
-    lock_swipe_candidate = false;
-    lock_swipe_just_confirmed = false;
-    lock_swipe_last_v = 0;
-    lock_swipe_last_velocity = 0;
 }
 
 void gui_lock_screen_init(void) {
@@ -409,13 +306,7 @@ void gui_lock_screen_init(void) {
     lock_clock_timer = NULL;
     lock_touch_timer = NULL;
     current_mode = LOCK_SCREEN_MODE_OFF;
-    lock_swipe_candidate = false;
-    lock_swipe_tracking = false;
-    lock_swipe_just_confirmed = false;
-    lock_swipe_touch_start_y = 0;
-    lock_swipe_last_v = 0;
-    lock_swipe_last_velocity = 0;
-    lock_swipe_ctx = NULL;
+    gesture_home_state_reset(&lock_gesture_state);
 }
 
 /* Called from gui_soft_reload() (gui_reload.c), after gui_navigation_teardown()
