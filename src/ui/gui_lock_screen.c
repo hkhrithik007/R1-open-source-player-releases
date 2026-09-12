@@ -83,11 +83,6 @@ static void lock_clock_timer_cb(lv_timer_t * timer) {
     update_clock_display();
 }
 
-static void lock_settle_done_cb(lv_anim_t * a) {
-    lock_settle_ctx = NULL;
-    slide_transition_done_cb(a);
-}
-
 static void lock_swipe_reset_state(void) {
     lock_swipe_candidate = false;
     lock_swipe_tracking = false;
